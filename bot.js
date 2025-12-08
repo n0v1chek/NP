@@ -2,190 +2,30 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const sharp = require('sharp');
-const fs = require('fs');
-const path = require('path');
+const express = require('express');
+const { v4: uuidv4 } = require('uuid');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const Replicate = require('replicate');
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 const ADMIN_IDS = process.env.ADMIN_IDS?.split(',').map(id => parseInt(id.trim())) || [];
 
-const DATA_FILE = path.join(__dirname, 'data.json');
+// PostgreSQL database
+const db = require('./db');
+
 const GENERATION_COST = 75; // 75 RUB за генерацию, маржа ~94%
 
-// ============ БАЗА ДАННЫХ ============
+// YooKassa конфигурация
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
+const PAYMENT_WEBHOOK_URL = process.env.PAYMENT_WEBHOOK_URL;
 
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.error('Error loading data:', e);
-  }
-  return { users: {}, companies: {}, transactions: [], generations: [] };
-}
+// Express сервер для webhook YooKassa
+const app = express();
+app.use(express.json());
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-function getUser(userId) {
-  const data = loadData();
-  return data.users[userId] || null;
-}
-
-function createUser(userId, companyId, name) {
-  const data = loadData();
-  data.users[userId] = {
-    id: userId,
-    companyId,
-    name,
-    balance: 0,
-    blocked: false,
-    createdAt: new Date().toISOString()
-  };
-  saveData(data);
-  return data.users[userId];
-}
-
-function updateUser(userId, updates) {
-  const data = loadData();
-  if (data.users[userId]) {
-    Object.assign(data.users[userId], updates);
-    saveData(data);
-  }
-}
-
-function deleteUser(userId) {
-  const data = loadData();
-  delete data.users[userId];
-  saveData(data);
-}
-
-function addTransaction(userId, amount, type, description) {
-  const data = loadData();
-  const tx = {
-    id: Date.now(),
-    userId,
-    amount,
-    type,
-    description,
-    createdAt: new Date().toISOString()
-  };
-  data.transactions.push(tx);
-  saveData(data);
-  return tx;
-}
-
-function addGeneration(userId, config) {
-  const data = loadData();
-  const gen = {
-    id: Date.now(),
-    userId,
-    config,
-    cost: GENERATION_COST,
-    createdAt: new Date().toISOString()
-  };
-  data.generations.push(gen);
-  saveData(data);
-  return gen;
-}
-
-function getAllUsers() {
-  return loadData().users;
-}
-
-function getAllTransactions() {
-  return loadData().transactions;
-}
-
-function getAllGenerations() {
-  return loadData().generations;
-}
-
-function getCompanies() {
-  return loadData().companies;
-}
-
-function getCompany(companyId) {
-  return loadData().companies[companyId];
-}
-
-function addCompany(name) {
-  const data = loadData();
-  const id = Date.now().toString();
-  data.companies[id] = {
-    id,
-    name,
-    createdAt: new Date().toISOString()
-  };
-  saveData(data);
-  return data.companies[id];
-}
-
-function deleteCompany(companyId) {
-  const data = loadData();
-  delete data.companies[companyId];
-  saveData(data);
-}
-
-function updateCompany(companyId, updates) {
-  const data = loadData();
-  if (data.companies[companyId]) {
-    Object.assign(data.companies[companyId], updates);
-    saveData(data);
-  }
-}
-
-function getUserGenerations(userId) {
-  const data = loadData();
-  return (data.generations || []).filter(g => g.userId == userId);
-}
-
-function getUserTransactions(userId) {
-  const data = loadData();
-  return (data.transactions || []).filter(t => t.userId == userId);
-}
-
-function getCompanyUsers(companyId) {
-  const users = getAllUsers();
-  return Object.values(users).filter(u => u.companyId === companyId);
-}
-
-// Заявки на доступ
-function getAccessRequests() {
-  const data = loadData();
-  return data.accessRequests || [];
-}
-
-function addAccessRequest(userId, username, firstName, lastName) {
-  const data = loadData();
-  if (!data.accessRequests) data.accessRequests = [];
-
-  // Проверяем, нет ли уже заявки
-  if (data.accessRequests.find(r => r.userId === userId)) {
-    return null;
-  }
-
-  const request = {
-    id: Date.now(),
-    userId,
-    username,
-    firstName,
-    lastName,
-    createdAt: new Date().toISOString()
-  };
-  data.accessRequests.push(request);
-  saveData(data);
-  return request;
-}
-
-function deleteAccessRequest(requestId) {
-  const data = loadData();
-  data.accessRequests = (data.accessRequests || []).filter(r => r.id !== requestId);
-  saveData(data);
-}
+// Хранилище ожидающих платежей
+const pendingPayments = new Map();
 
 // ============ СОСТОЯНИЯ ============
 
@@ -278,18 +118,20 @@ const PROMPT_DETAILS = {
 
 function buildPrompt(config) {
   const parts = [];
-  parts.push('Edit this room photo. Replace ONLY the ceiling. Do not change walls, floor, furniture, windows, doors.');
+
+  // Улучшенный промпт для лучшего качества
+  parts.push('Professional interior photo edit. Replace ONLY the ceiling surface. Keep walls, floor, furniture, windows, doors exactly as they are. Maintain original room perspective, lighting direction and shadows.');
 
   const color = PROMPT_DETAILS.colors[config.color] || PROMPT_DETAILS.colors.white;
   const texture = PROMPT_DETAILS.textures[config.texture] || PROMPT_DETAILS.textures.matte;
 
   if (config.twoLevel) {
-    parts.push(`Install two-level stretch ceiling: ${color}, ${texture}. Gypsum board frame around perimeter.`);
+    parts.push(`Install modern two-level stretch ceiling system: main surface is ${color} with ${texture}. Add 15cm dropped gypsum board frame around entire perimeter with integrated cove lighting.`);
   } else {
-    parts.push(`Install flat stretch ceiling: ${color}, ${texture}.`);
+    parts.push(`Install perfectly flat stretch ceiling: ${color}, ${texture}. Seamless installation from wall to wall.`);
   }
 
-  // Профили - упрощенное описание
+  // Профили - более детальное описание
   const shadowWalls = [];
   const floatingWalls = [];
 
@@ -298,62 +140,64 @@ function buildPrompt(config) {
     else if (type === 'floating') floatingWalls.push(wall);
   }
 
-  if (shadowWalls.length > 0 || floatingWalls.length > 0) {
-    if (shadowWalls.length > 0) {
-      parts.push(`Black shadow gap (thin dark 10mm line) where ceiling meets ${shadowWalls.length === 4 ? 'all walls' : shadowWalls.length + ' wall(s)'}.`);
-    }
-    if (floatingWalls.length > 0) {
-      parts.push(`Floating ceiling effect with hidden LED strip (warm white glow) on ${floatingWalls.length === 4 ? 'all walls' : floatingWalls.length + ' wall(s)'}.`);
-    }
+  if (shadowWalls.length > 0) {
+    parts.push(`Add shadow gap profile (8-10mm black recessed line creating visual separation) where ceiling meets ${shadowWalls.length === 4 ? 'all four walls' : shadowWalls.length + ' wall(s)'}. Creates floating illusion.`);
+  }
+  if (floatingWalls.length > 0) {
+    parts.push(`Add floating ceiling effect with hidden LED perimeter lighting (soft warm white glow emanating from 3cm gap between ceiling and ${floatingWalls.length === 4 ? 'all walls' : floatingWalls.length + ' wall(s)'}).`);
   }
 
-  // Споты - описываем через сетку для лучшего понимания моделью
+  // Споты - улучшенное описание с точным позиционированием
   if (config.spots.enabled && config.spots.count > 0) {
     const spotType = PROMPT_DETAILS.spots.types[config.spots.type] || PROMPT_DETAILS.spots.types.round;
-    const spotColor = PROMPT_DETAILS.spots.colors[config.spots.color] || '';
+    const spotColor = PROMPT_DETAILS.spots.colors[config.spots.color] || 'white housing';
 
-    // Преобразуем количество в сетку rows x cols
+    // Описание сетки
     let gridDesc;
     switch (config.spots.count) {
-      case 1: gridDesc = 'single spotlight in center (1 total)'; break;
-      case 2: gridDesc = '1 row x 2 columns (2 total)'; break;
-      case 4: gridDesc = '2 rows x 2 columns (4 total)'; break;
-      case 6: gridDesc = '2 rows x 3 columns (6 total)'; break;
-      case 8: gridDesc = '2 rows x 4 columns (8 total)'; break;
-      case 10: gridDesc = '2 rows x 5 columns (10 total)'; break;
-      case 12: gridDesc = '3 rows x 4 columns (12 total)'; break;
-      case 16: gridDesc = '4 rows x 4 columns (16 total)'; break;
-      default: gridDesc = `${config.spots.count} spotlights evenly spaced`; break;
+      case 1: gridDesc = 'single centered recessed downlight'; break;
+      case 2: gridDesc = 'two recessed downlights in a row, evenly spaced'; break;
+      case 4: gridDesc = 'four recessed downlights in 2x2 symmetrical grid pattern'; break;
+      case 6: gridDesc = 'six recessed downlights in 2 rows of 3, symmetrically arranged'; break;
+      case 8: gridDesc = 'eight recessed downlights in 2 rows of 4, evenly distributed'; break;
+      case 10: gridDesc = 'ten recessed downlights in 2 rows of 5'; break;
+      case 12: gridDesc = 'twelve recessed downlights in 3 rows of 4, grid pattern'; break;
+      case 16: gridDesc = 'sixteen recessed downlights in 4x4 grid'; break;
+      default: gridDesc = `${config.spots.count} recessed downlights evenly distributed across ceiling`; break;
     }
 
-    parts.push(`${spotType} with ${spotColor} arranged in grid: ${gridDesc}, all lights ON, small 5cm diameter each.`);
+    parts.push(`Install ${gridDesc}. Each light is ${spotType} with ${spotColor}, 5-7cm diameter, all lights turned ON emitting warm white light.`);
   }
 
   if (config.chandelier.enabled) {
     const style = PROMPT_DETAILS.chandeliers[config.chandelier.style] || PROMPT_DETAILS.chandeliers.modern;
-    parts.push(`One ${style} in ceiling center.`);
+    parts.push(`Hang one elegant ${style} from exact ceiling center, appropriately sized for the room, turned ON.`);
   }
 
   if (config.lightlines.enabled && config.lightlines.count > 0) {
     const direction = PROMPT_DETAILS.lightlines.directions[config.lightlines.direction];
     const shape = PROMPT_DETAILS.lightlines.shapes[config.lightlines.shape];
-    parts.push(`${config.lightlines.count} ${shape} ${direction}, white light.`);
+    parts.push(`Install ${config.lightlines.count} ${shape} ${direction} the room, recessed into ceiling with even spacing, emitting bright white linear light.`);
   }
 
   if (config.track.enabled) {
-    parts.push(`${PROMPT_DETAILS.track[config.track.color]}.`);
+    const trackDesc = config.track.color === 'black'
+      ? 'sleek black magnetic track lighting system with 4-6 adjustable spotlights'
+      : 'modern white magnetic track lighting system with 4-6 adjustable spotlights';
+    parts.push(`Mount ${trackDesc} running along ceiling center.`);
   }
 
   if (config.ledStrip.enabled) {
-    const ledColor = config.ledStrip.color === 'warm' ? 'warm white' : config.ledStrip.color === 'cold' ? 'cool white' : 'RGB color';
-    parts.push(`Hidden ${ledColor} LED strip around entire ceiling perimeter.`);
+    const ledColor = config.ledStrip.color === 'warm' ? 'warm white (3000K)' : config.ledStrip.color === 'cold' ? 'cool white (6000K)' : 'RGB multicolor';
+    parts.push(`Add continuous ${ledColor} LED strip lighting hidden in ceiling perimeter, creating ambient glow around entire room.`);
   }
 
   if (config.niche) {
-    parts.push('Recessed curtain niche at window wall.');
+    parts.push('Include recessed ceiling niche (15cm deep slot) at window wall for hidden curtain track/rod.');
   }
 
-  parts.push('Photorealistic result, same room perspective.');
+  parts.push('Ultra photorealistic result. Professional architectural photography quality. Sharp details, accurate materials, proper light reflections matching original room lighting.');
+
   return parts.join(' ');
 }
 
@@ -389,16 +233,36 @@ function buildSummary(config) {
 
 // ============ ГЛАВНОЕ МЕНЮ ============
 
-function mainMenuKeyboard(userId) {
-  const user = getUser(userId);
+// Постоянная клавиатура внизу экрана
+function persistentKeyboard(isAdminUser) {
+  if (isAdminUser) {
+    return Markup.keyboard([
+      ['📸 Новая визуализация', '🖼 Мои работы'],
+      ['💳 Пополнение', '👑 Админ-панель'],
+      ['📖 Помощь']
+    ]).resize();
+  }
+  return Markup.keyboard([
+    ['📸 Новая визуализация', '🖼 Мои работы'],
+    ['💰 Баланс', '💳 Пополнить'],
+    ['📖 Помощь']
+  ]).resize();
+}
+
+async function mainMenuKeyboard(userId) {
+  const user = await db.getUser(userId);
   const buttons = [];
 
   if (isAdmin(userId)) {
     buttons.push([Markup.button.callback('📸 Новая визуализация', 'new_visual')]);
+    buttons.push([Markup.button.callback('🖼 Мои работы', 'my_works')]);
+    buttons.push([Markup.button.callback('💳 Оплата / Пополнение', 'pay_balance')]);
     buttons.push([Markup.button.callback('👑 Админ-панель', 'admin')]);
   } else if (user) {
     buttons.push([Markup.button.callback('📸 Новая визуализация', 'new_visual')]);
+    buttons.push([Markup.button.callback('🖼 Мои работы', 'my_works')]);
     buttons.push([Markup.button.callback('💰 Баланс: ' + (user.balance || 0) + ' ₽', 'balance')]);
+    buttons.push([Markup.button.callback('💳 Пополнить баланс', 'pay_balance')]);
   }
 
   return Markup.inlineKeyboard(buttons);
@@ -406,33 +270,65 @@ function mainMenuKeyboard(userId) {
 
 // ============ КОМАНДА START ============
 
-bot.command('start', ctx => {
+bot.command('start', async ctx => {
   const userId = ctx.from.id;
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
 
   let text = '🏠 *Визуализация натяжных потолков*\n\n';
 
+  const disclaimer = '💡 _Умная нейросеть создаёт визуализации за секунды — покажите клиенту будущий потолок прямо на встрече!\n\n⚠️ Любой ИИ может немного отклоняться от настроек: добавить 4 светильника вместо 2 или изменить оттенок — так устроены все нейросети в мире. Мы используем лучшие технологии и максимально точные промпты._';
+
   if (isAdmin(userId)) {
     text += '👑 Вы администратор\n\n';
-    text += 'Используйте админ-панель для управления.';
+    text += disclaimer;
   } else if (user) {
-    const company = getCompany(user.companyId);
+    const company = await db.getCompany(user.company_id);
     text += `🏢 ${company?.name || 'Компания'}\n`;
     text += `💰 Баланс: ${user.balance} ₽\n\n`;
-    text += 'Отправьте фото для визуализации.';
+    text += disclaimer;
   } else {
     // Проверяем, есть ли уже заявка
-    const requests = getAccessRequests();
-    const hasRequest = requests.find(r => r.userId === userId);
+    const existingRequest = await db.getAccessRequestByUserId(userId);
 
-    if (hasRequest) {
+    if (existingRequest) {
       text += '⏳ Ваша заявка на рассмотрении.\n\n';
       text += 'Ожидайте подтверждения администратора.';
-      ctx.reply(text, { parse_mode: 'Markdown' });
+      await ctx.reply(text, { parse_mode: 'Markdown' });
     } else {
-      text += '⚠️ У вас нет доступа.\n\n';
-      text += 'Нажмите кнопку ниже, чтобы отправить запрос на получение доступа.';
-      ctx.reply(text, {
+      // Описание преимуществ для новых пользователей
+      const welcomeText = `🏠 *Визуализация натяжных потолков*
+
+🎯 *Что вы получите:*
+
+📸 *Мгновенная визуализация* — загрузите фото комнаты и получите реалистичный результат за 30-60 секунд
+
+🎨 *Гибкие настройки:*
+  • 8 цветов потолка (белый, бежевый, чёрный и др.)
+  • 4 текстуры (матовый, глянцевый, сатин, металлик)
+  • Теневые и парящие профили
+  • Одно- и двухуровневые конструкции
+
+💡 *Освещение на любой вкус:*
+  • Точечные светильники (1-16 шт)
+  • Люстры разных стилей
+  • Световые линии
+  • Трековые системы
+  • LED-подсветка
+
+⭐ *Дополнительные возможности:*
+  • Быстрые пресеты (Минимализм, Классика, Премиум)
+  • Сохранение любимых конфигураций
+  • История всех генераций
+  • Перегенерация с теми же настройками
+
+💼 *Идеально для:*
+  • Показа клиенту прямо на замере
+  • Презентации вариантов в офисе
+  • Согласования дизайна до монтажа
+
+_Стоимость: 75₽ за генерацию_`;
+
+      await ctx.reply(welcomeText, {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([[Markup.button.callback('📝 Запросить доступ', 'request_access')]])
       });
@@ -440,7 +336,265 @@ bot.command('start', ctx => {
     return;
   }
 
-  ctx.reply(text, { parse_mode: 'Markdown', ...mainMenuKeyboard(userId) });
+  // Отправляем с постоянной клавиатурой
+  await ctx.reply(text, {
+    parse_mode: 'Markdown',
+    ...persistentKeyboard(isAdmin(userId))
+  });
+});
+
+// ============ ОБРАБОТКА КНОПОК КЛАВИАТУРЫ ============
+
+bot.hears('📸 Новая визуализация', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!isAdmin(userId) && !user) {
+    return ctx.reply('⚠️ У вас нет доступа. Отправьте /start для регистрации.');
+  }
+
+  if (!isAdmin(userId) && user.balance < GENERATION_COST) {
+    return ctx.reply(
+      `❌ Недостаточно средств.\n\nНужно: ${GENERATION_COST} ₽\nВаш баланс: ${user.balance} ₽`,
+      Markup.inlineKeyboard([[Markup.button.callback('💳 Пополнить', 'pay_balance')]])
+    );
+  }
+
+  const state = getState(userId);
+  state.photo = null;
+  state.config = getDefaultConfig();
+  state.step = 'waiting_photo';
+
+  await ctx.reply(
+    '📸 *Новая визуализация*\n\n' +
+    'Отправьте фото комнаты для визуализации потолка.\n\n' +
+    '_Лучше всего подходят фото с видом на потолок целиком._',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.hears('🖼 Мои работы', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user && !isAdmin(userId)) {
+    return ctx.reply('⚠️ У вас нет доступа.');
+  }
+
+  const allGenerations = await db.getUserGenerations(userId);
+  const generations = allGenerations.slice(0, 10);
+
+  if (generations.length === 0) {
+    return ctx.reply(
+      '🖼 *Мои работы*\n\nУ вас пока нет генераций.\n\nНажмите "📸 Новая визуализация" чтобы создать первую!',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  const buttons = generations.map((gen, index) => {
+    const date = new Date(gen.created_at).toLocaleDateString('ru-RU');
+    const colors = { white: '⬜', ivory: '🤍', beige: '🟨', gray: '⬛', darkgray: '🖤', black: '⚫', blue: '🔵', pink: '🩷' };
+    const config = typeof gen.config === 'string' ? JSON.parse(gen.config) : gen.config;
+    const colorIcon = colors[config?.color] || '⬜';
+    return [Markup.button.callback(`${colorIcon} ${date} #${generations.length - index}`, `view_work_${gen.id}`)];
+  });
+
+  await ctx.reply(
+    `🖼 *Мои работы*\n\nПоследние ${generations.length} генераций:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+bot.hears('💰 Баланс', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user) {
+    return ctx.reply('⚠️ У вас нет доступа. Отправьте /start для регистрации.');
+  }
+
+  const gensAvailable = Math.floor(user.balance / GENERATION_COST);
+  await ctx.reply(
+    `💰 *Ваш баланс: ${user.balance} ₽*\n\n` +
+    `📊 Стоимость генерации: ${GENERATION_COST} ₽\n` +
+    `🖼 Доступно генераций: ${gensAvailable}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('💳 Пополнить', 'pay_balance')],
+        [Markup.button.callback('📜 История', 'history')]
+      ])
+    }
+  );
+});
+
+bot.hears(['💳 Пополнить', '💳 Пополнение'], async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user && !isAdmin(userId)) {
+    return ctx.reply('⚠️ У вас нет доступа. Отправьте /start для регистрации.');
+  }
+
+  await ctx.reply(
+    '💳 *Пополнение баланса*\n\n' +
+    'Выберите сумму пополнения:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('300 ₽ (4 генерации)', 'pay_300')],
+        [Markup.button.callback('500 ₽ (6 генераций)', 'pay_500')],
+        [Markup.button.callback('1000 ₽ (13 генераций)', 'pay_1000')],
+        [Markup.button.callback('2000 ₽ (26 генераций)', 'pay_2000')]
+      ])
+    }
+  );
+});
+
+bot.hears('👑 Админ-панель', async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const stats = await db.getStats();
+
+  await ctx.reply(
+    '👑 *Админ-панель*\n\n' +
+    `🏢 Компаний: ${stats.companies_count}\n` +
+    `👥 Пользователей: ${stats.users_count}` + (parseInt(stats.blocked_count) > 0 ? ` (🚫 ${stats.blocked_count})` : '') + '\n' +
+    `💰 Баланс на счетах: ${stats.total_balance} ₽\n` +
+    `🖼 Всего генераций: ${stats.generations_count}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🏢 Компании', 'admin_companies'), Markup.button.callback('👥 Все пользователи', 'admin_all_users')],
+        [Markup.button.callback(`📋 Заявки (${stats.requests_count})`, 'admin_requests')],
+        [Markup.button.callback('⚠️ Низкий баланс', 'admin_low_balance')],
+        [Markup.button.callback('📊 Статистика', 'admin_stats'), Markup.button.callback('💳 Транзакции', 'admin_transactions')]
+      ])
+    }
+  );
+});
+
+bot.hears('📖 Помощь', async ctx => {
+  const helpText = `📖 *Помощь*
+
+*Как пользоваться ботом:*
+
+1️⃣ Нажмите "📸 Новая визуализация"
+2️⃣ Загрузите фото комнаты
+3️⃣ Настройте параметры потолка
+4️⃣ Нажмите "Сгенерировать"
+5️⃣ Получите результат за 30-60 сек
+
+*Доступные настройки:*
+🎨 Цвет и текстура потолка
+📐 Профили (теневой, парящий)
+🏗 Уровни (одно-/двухуровневый)
+💡 Освещение (споты, люстры, линии)
+💫 LED-подсветка и ниши
+
+*Стоимость:* 75₽ за генерацию`;
+
+  await ctx.reply(helpText, { parse_mode: 'Markdown' });
+});
+
+// ============ ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ ============
+
+bot.command('help', async ctx => {
+  const helpText = `📖 *Помощь*
+
+*Как пользоваться ботом:*
+
+1️⃣ Нажмите "Новая визуализация"
+2️⃣ Загрузите фото комнаты
+3️⃣ Настройте параметры потолка
+4️⃣ Нажмите "Сгенерировать"
+5️⃣ Получите результат за 30-60 сек
+
+*Доступные настройки:*
+🎨 Цвет и текстура потолка
+📐 Профили (теневой, парящий)
+🏗 Уровни (одно-/двухуровневый)
+💡 Освещение (споты, люстры, линии)
+💫 LED-подсветка и ниши
+
+*Команды:*
+/start — главное меню
+/new — новая визуализация
+/balance — проверить баланс
+/help — эта справка
+
+*Стоимость:* 75₽ за генерацию`;
+
+  await ctx.reply(helpText, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Меню', 'back_main')]])
+  });
+});
+
+bot.command('balance', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user && !isAdmin(userId)) {
+    return ctx.reply('⚠️ У вас нет доступа. Отправьте /start для регистрации.');
+  }
+
+  if (isAdmin(userId)) {
+    return ctx.reply('👑 Вы администратор — баланс не ограничен!', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Меню', 'back_main')]])
+    });
+  }
+
+  const gensAvailable = Math.floor(user.balance / GENERATION_COST);
+  await ctx.reply(
+    `💰 *Ваш баланс: ${user.balance} ₽*\n\n` +
+    `📊 Стоимость генерации: ${GENERATION_COST} ₽\n` +
+    `🖼 Доступно генераций: ${gensAvailable}`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('💳 Пополнить', 'pay_balance')],
+        [Markup.button.callback('🏠 Меню', 'back_main')]
+      ])
+    }
+  );
+});
+
+bot.command('new', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!isAdmin(userId) && !user) {
+    return ctx.reply('⚠️ У вас нет доступа. Отправьте /start для регистрации.');
+  }
+
+  if (!isAdmin(userId) && user.balance < GENERATION_COST) {
+    return ctx.reply(
+      `❌ Недостаточно средств.\n\nНужно: ${GENERATION_COST} ₽\nВаш баланс: ${user.balance} ₽`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('💳 Пополнить', 'pay_balance')]])
+      }
+    );
+  }
+
+  const state = getState(userId);
+  state.photo = null;
+  state.config = getDefaultConfig();
+  state.step = 'waiting_photo';
+
+  await ctx.reply(
+    '📸 *Новая визуализация*\n\n' +
+    'Отправьте фото комнаты для визуализации потолка.\n\n' +
+    '_Лучше всего подходят фото с видом на потолок целиком._',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'back_main')]])
+    }
+  );
 });
 
 // ============ ЗАПРОС ДОСТУПА ============
@@ -451,7 +605,7 @@ bot.action('request_access', async ctx => {
   const firstName = ctx.from.first_name || '';
   const lastName = ctx.from.last_name || '';
 
-  const request = addAccessRequest(userId, username, firstName, lastName);
+  const request = await db.addAccessRequest(userId, username, firstName, lastName);
 
   if (!request) {
     await ctx.answerCbQuery('Заявка уже отправлена');
@@ -490,7 +644,7 @@ bot.action('request_access', async ctx => {
 
 bot.action('balance', async ctx => {
   const userId = ctx.from.id;
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Нет доступа');
 
   await ctx.answerCbQuery();
@@ -502,6 +656,7 @@ bot.action('balance', async ctx => {
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
+        [Markup.button.callback('💳 Пополнить баланс', 'pay_balance')],
         [Markup.button.callback('📜 История', 'history')],
         [Markup.button.callback('⬅️ Назад', 'back_main')]
       ])
@@ -511,15 +666,16 @@ bot.action('balance', async ctx => {
 
 bot.action('history', async ctx => {
   const userId = ctx.from.id;
-  const transactions = getAllTransactions().filter(t => t.userId == userId).slice(-10).reverse();
+  const transactions = await db.getUserTransactions(userId);
+  const lastTen = transactions.slice(0, 10);
 
   let text = '📜 *История операций*\n\n';
-  if (transactions.length === 0) {
+  if (lastTen.length === 0) {
     text += 'Пока нет операций';
   } else {
-    transactions.forEach(t => {
+    lastTen.forEach(t => {
       const sign = t.amount >= 0 ? '+' : '';
-      const date = new Date(t.createdAt).toLocaleDateString('ru-RU');
+      const date = new Date(t.created_at).toLocaleDateString('ru-RU');
       text += `${sign}${t.amount} ₽ — ${t.description} (${date})\n`;
     });
   }
@@ -531,31 +687,133 @@ bot.action('history', async ctx => {
   });
 });
 
+// ============ МОИ РАБОТЫ ============
+
+bot.action('my_works', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user && !isAdmin(userId)) {
+    return ctx.answerCbQuery('Нет доступа');
+  }
+
+  const allGenerations = await db.getUserGenerations(userId);
+  const generations = allGenerations.slice(0, 10);
+
+  if (generations.length === 0) {
+    await ctx.answerCbQuery();
+    return ctx.editMessageText(
+      '🖼 *Мои работы*\n\nУ вас пока нет генераций.\n\nНажмите "Новая визуализация" чтобы создать первую!',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('📸 Новая визуализация', 'new_visual')],
+          [Markup.button.callback('⬅️ Назад', 'back_main')]
+        ])
+      }
+    );
+  }
+
+  // Показываем список генераций
+  const buttons = generations.map((gen, index) => {
+    const date = new Date(gen.created_at).toLocaleDateString('ru-RU');
+    const colors = { white: '⬜', ivory: '🤍', beige: '🟨', gray: '⬛', darkgray: '🖤', black: '⚫', blue: '🔵', pink: '🩷' };
+    const config = typeof gen.config === 'string' ? JSON.parse(gen.config) : gen.config;
+    const colorIcon = colors[config?.color] || '⬜';
+    return [Markup.button.callback(`${colorIcon} ${date} #${generations.length - index}`, `view_work_${gen.id}`)];
+  });
+
+  buttons.push([Markup.button.callback('⬅️ Назад', 'back_main')]);
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `🖼 *Мои работы*\n\nПоследние ${generations.length} генераций:\n\n` +
+    '_Нажмите на работу чтобы посмотреть_\n' +
+    '_⚠️ Изображения доступны ~24 часа_',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+bot.action(/^view_work_(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const genId = parseInt(ctx.match[1]);
+
+  const generations = await db.getUserGenerations(userId);
+  const gen = generations.find(g => g.id === genId);
+
+  if (!gen) {
+    return ctx.answerCbQuery('Работа не найдена');
+  }
+
+  await ctx.answerCbQuery();
+
+  const date = new Date(gen.created_at).toLocaleString('ru-RU');
+  const config = typeof gen.config === 'string' ? JSON.parse(gen.config) : gen.config;
+
+  if (gen.result_url) {
+    try {
+      await ctx.replyWithPhoto({ url: gen.result_url }, {
+        caption: `🖼 *Генерация от ${date}*\n\n` + buildSummary(config),
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔙 К списку работ', 'my_works')],
+          [Markup.button.callback('🏠 Меню', 'back_main')]
+        ])
+      });
+    } catch (e) {
+      // URL истёк
+      await ctx.reply(
+        `🖼 *Генерация от ${date}*\n\n` +
+        buildSummary(config) +
+        '\n\n⚠️ _Изображение больше недоступно (истёк срок хранения)_',
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 К списку работ', 'my_works')],
+            [Markup.button.callback('🏠 Меню', 'back_main')]
+          ])
+        }
+      );
+    }
+  } else {
+    await ctx.reply(
+      `🖼 *Генерация от ${date}*\n\n` +
+      buildSummary(config) +
+      '\n\n⚠️ _Изображение не сохранено_',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔙 К списку работ', 'my_works')],
+          [Markup.button.callback('🏠 Меню', 'back_main')]
+        ])
+      }
+    );
+  }
+});
+
 // ============ АДМИН-ПАНЕЛЬ ============
 
 bot.action('admin', async ctx => {
   if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Нет доступа');
 
-  const data = loadData();
-  const usersCount = Object.keys(data.users).length;
-  const blockedCount = Object.values(data.users).filter(u => u.blocked).length;
-  const companiesCount = Object.keys(data.companies).length;
-  const totalBalance = Object.values(data.users).reduce((sum, u) => sum + (u.balance || 0), 0);
-  const genCount = data.generations?.length || 0;
-  const requestsCount = getAccessRequests().length;
+  const stats = await db.getStats();
 
   await ctx.answerCbQuery();
   await ctx.editMessageText(
     '👑 *Админ-панель*\n\n' +
-    `🏢 Компаний: ${companiesCount}\n` +
-    `👥 Пользователей: ${usersCount}` + (blockedCount > 0 ? ` (🚫 ${blockedCount})` : '') + '\n' +
-    `💰 Баланс на счетах: ${totalBalance} ₽\n` +
-    `🖼 Всего генераций: ${genCount}`,
+    `🏢 Компаний: ${stats.companies_count}\n` +
+    `👥 Пользователей: ${stats.users_count}` + (parseInt(stats.blocked_count) > 0 ? ` (🚫 ${stats.blocked_count})` : '') + '\n' +
+    `💰 Баланс на счетах: ${stats.total_balance} ₽\n` +
+    `🖼 Всего генераций: ${stats.generations_count}`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🏢 Компании', 'admin_companies'), Markup.button.callback('👥 Все пользователи', 'admin_all_users')],
-        [Markup.button.callback(`📋 Заявки (${requestsCount})`, 'admin_requests')],
+        [Markup.button.callback(`📋 Заявки (${stats.requests_count})`, 'admin_requests')],
+        [Markup.button.callback('⚠️ Низкий баланс', 'admin_low_balance')],
         [Markup.button.callback('📊 Статистика', 'admin_stats'), Markup.button.callback('💳 Транзакции', 'admin_transactions')],
         [Markup.button.callback('⬅️ Назад', 'back_main')]
       ])
@@ -563,13 +821,84 @@ bot.action('admin', async ctx => {
   );
 });
 
+// ============ НИЗКИЙ БАЛАНС ============
+
+bot.action('admin_low_balance', async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const lowBalanceUsers = await db.getLowBalanceUsers(150); // 2 генерации = 150₽
+
+  await ctx.answerCbQuery();
+
+  if (lowBalanceUsers.length === 0) {
+    await ctx.editMessageText(
+      '⚠️ *Пользователи с низким балансом*\n\n' +
+      '✅ Нет пользователей с балансом ≤150₽',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'admin')]])
+      }
+    );
+    return;
+  }
+
+  let text = `⚠️ *Пользователи с низким балансом*\n\n`;
+  text += `Пользователей: ${lowBalanceUsers.length}\n\n`;
+
+  lowBalanceUsers.slice(0, 15).forEach((u, i) => {
+    const gensLeft = Math.floor(u.balance / GENERATION_COST);
+    text += `${i + 1}. ${u.name || 'Без имени'} (${u.company_name || '—'})\n`;
+    text += `   💰 ${u.balance}₽ = ${gensLeft} генераций\n`;
+  });
+
+  if (lowBalanceUsers.length > 15) {
+    text += `\n...и ещё ${lowBalanceUsers.length - 15} пользователей`;
+  }
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('📨 Уведомить всех', 'notify_low_balance')],
+      [Markup.button.callback('⬅️ Назад', 'admin')]
+    ])
+  });
+});
+
+bot.action('notify_low_balance', async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const lowBalanceUsers = await db.getLowBalanceUsers(150);
+  let sent = 0;
+
+  for (const user of lowBalanceUsers) {
+    try {
+      const gensLeft = Math.floor(user.balance / GENERATION_COST);
+      await bot.telegram.sendMessage(user.id,
+        `⚠️ *Низкий баланс*\n\n` +
+        `Ваш баланс: ${user.balance}₽\n` +
+        `Осталось генераций: ${gensLeft}\n\n` +
+        `Пополните баланс, чтобы продолжить создавать визуализации!`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.callback('💳 Пополнить', 'pay_balance')]])
+        }
+      );
+      sent++;
+    } catch (e) {
+      // Пользователь заблокировал бота
+    }
+  }
+
+  await ctx.answerCbQuery(`Уведомлено ${sent} из ${lowBalanceUsers.length} пользователей`);
+});
+
 // ============ ВСЕ ПОЛЬЗОВАТЕЛИ ============
 
 bot.action('admin_all_users', async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
-  const users = Object.values(getAllUsers());
-  const companies = getCompanies();
+  const users = Object.values(await db.getAllUsers());
+  const companies = await db.getCompanies();
 
   if (users.length === 0) {
     await ctx.answerCbQuery();
@@ -588,7 +917,7 @@ bot.action('admin_all_users', async ctx => {
   });
 
   const buttons = users.slice(0, 15).map(u => {
-    const company = companies[u.companyId];
+    const company = companies[u.company_id];
     const status = u.blocked ? '🚫' : '✅';
     const name = u.name || 'ID:' + u.id;
     return [Markup.button.callback(`${status} ${name} (${u.balance}₽)`, `admin_user_${u.id}`)];
@@ -612,14 +941,14 @@ bot.action(/^admin_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  const company = getCompany(user.companyId);
-  const gens = getUserGenerations(userId);
-  const txs = getUserTransactions(userId);
+  const company = await db.getCompany(user.company_id);
+  const gens = await db.getUserGenerations(userId);
+  const txs = await db.getUserTransactions(userId);
   const totalSpent = txs.filter(t => t.type === 'generation').reduce((sum, t) => sum + Math.abs(t.amount), 0);
-  const regDate = new Date(user.createdAt).toLocaleDateString('ru-RU');
+  const regDate = new Date(user.created_at).toLocaleDateString('ru-RU');
 
   let text = `👤 *${user.name || 'Без имени'}*\n\n`;
   text += `🆔 ID: \`${userId}\`\n`;
@@ -648,11 +977,11 @@ bot.action(/^toggle_block_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
   const newStatus = !user.blocked;
-  updateUser(userId, { blocked: newStatus });
+  await db.updateUser(userId, { blocked: newStatus });
 
   // Уведомляем пользователя
   try {
@@ -666,11 +995,11 @@ bot.action(/^toggle_block_(\d+)$/, async ctx => {
   await ctx.answerCbQuery(newStatus ? 'Заблокирован' : 'Разблокирован');
 
   // Обновляем экран
-  const company = getCompany(user.companyId);
-  const gens = getUserGenerations(userId);
-  const txs = getUserTransactions(userId);
+  const company = await db.getCompany(user.company_id);
+  const gens = await db.getUserGenerations(userId);
+  const txs = await db.getUserTransactions(userId);
   const totalSpent = txs.filter(t => t.type === 'generation').reduce((sum, t) => sum + Math.abs(t.amount), 0);
-  const regDate = new Date(user.createdAt).toLocaleDateString('ru-RU');
+  const regDate = new Date(user.created_at).toLocaleDateString('ru-RU');
 
   let text = `👤 *${user.name || 'Без имени'}*\n\n`;
   text += `🆔 ID: \`${userId}\`\n`;
@@ -698,7 +1027,7 @@ bot.action(/^deduct_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
   const state = getState(ctx.from.id);
@@ -730,14 +1059,14 @@ bot.action(/^do_deduct_(\d+)$/, async ctx => {
 
   if (!userId) return ctx.answerCbQuery('Ошибка');
 
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
   const deductAmount = Math.min(amount, user.balance);
   if (deductAmount <= 0) return ctx.answerCbQuery('Нечего списывать');
 
-  updateUser(userId, { balance: user.balance - deductAmount });
-  addTransaction(userId, -deductAmount, 'deduct', 'Списание администратором');
+  await db.updateUser(userId, { balance: user.balance - deductAmount });
+  await db.addTransaction(userId, -deductAmount, 'deduct', 'Списание администратором');
 
   try {
     await bot.telegram.sendMessage(userId, `💸 С вашего баланса списано ${deductAmount} ₽\n\nТекущий баланс: ${user.balance - deductAmount} ₽`);
@@ -756,10 +1085,10 @@ bot.action(/^change_company_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  const companies = Object.values(getCompanies());
+  const companies = Object.values(await db.getCompanies());
 
   if (companies.length === 0) {
     return ctx.answerCbQuery('Нет компаний');
@@ -767,7 +1096,7 @@ bot.action(/^change_company_(\d+)$/, async ctx => {
 
   const buttons = companies.map(c => [
     Markup.button.callback(
-      (c.id === user.companyId ? '✅ ' : '') + c.name,
+      (c.id === user.company_id ? '✅ ' : '') + c.name,
       `set_company_${userId}_${c.id}`
     )
   ]);
@@ -786,13 +1115,13 @@ bot.action(/^set_company_(\d+)_(.+)$/, async ctx => {
   const userId = ctx.match[1];
   const companyId = ctx.match[2];
 
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
-  updateUser(userId, { companyId });
+  await db.updateUser(userId, { companyId });
 
   await ctx.answerCbQuery(`Перемещён в ${company.name}`);
   await ctx.editMessageText(`✅ Пользователь перемещён в "${company.name}"`, {
@@ -805,7 +1134,7 @@ bot.action(/^user_history_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const txs = getUserTransactions(userId).slice(-15).reverse();
+  const txs = await db.getUserTransactions(userId).slice(-15).reverse();
 
   let text = `📜 *История операций*\n\n`;
 
@@ -814,7 +1143,7 @@ bot.action(/^user_history_(\d+)$/, async ctx => {
   } else {
     txs.forEach(t => {
       const sign = t.amount >= 0 ? '+' : '';
-      const date = new Date(t.createdAt).toLocaleDateString('ru-RU');
+      const date = new Date(t.created_at).toLocaleDateString('ru-RU');
       text += `${sign}${t.amount} ₽ — ${t.description} (${date})\n`;
     });
   }
@@ -831,7 +1160,7 @@ bot.action(/^confirm_delete_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
   await ctx.answerCbQuery();
@@ -854,7 +1183,7 @@ bot.action(/^do_delete_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  deleteUser(userId);
+  await db.deleteUser(userId);
 
   await ctx.answerCbQuery('Удалён');
   await ctx.editMessageText('✅ Пользователь удалён', {
@@ -867,8 +1196,8 @@ bot.action(/^do_delete_user_(\d+)$/, async ctx => {
 bot.action('admin_transactions', async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
-  const txs = getAllTransactions().slice(-20).reverse();
-  const users = getAllUsers();
+  const txs = await db.getAllTransactions().slice(-20).reverse();
+  const users = await db.getAllUsers();
 
   let text = `💳 *Последние транзакции*\n\n`;
 
@@ -876,10 +1205,10 @@ bot.action('admin_transactions', async ctx => {
     text += 'Нет транзакций';
   } else {
     txs.forEach(t => {
-      const user = users[t.userId];
-      const userName = user?.name || 'ID:' + t.userId;
+      const user = users[t.user_id];
+      const userName = user?.name || 'ID:' + t.user_id;
       const sign = t.amount >= 0 ? '+' : '';
-      const date = new Date(t.createdAt).toLocaleDateString('ru-RU');
+      const date = new Date(t.created_at).toLocaleDateString('ru-RU');
       const icon = t.type === 'topup' ? '💰' : t.type === 'generation' ? '🖼' : '💸';
       text += `${icon} ${sign}${t.amount}₽ | ${userName} | ${date}\n`;
     });
@@ -897,7 +1226,7 @@ bot.action('admin_transactions', async ctx => {
 bot.action('admin_requests', async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
-  const requests = getAccessRequests();
+  const requests = await db.getAccessRequests();
 
   if (requests.length === 0) {
     await ctx.answerCbQuery();
@@ -909,7 +1238,7 @@ bot.action('admin_requests', async ctx => {
   }
 
   const buttons = requests.slice(0, 10).map(r => {
-    const name = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Без имени';
+    const name = [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Без имени';
     const tag = r.username ? `@${r.username}` : '';
     return [Markup.button.callback(`👤 ${name} ${tag}`, `view_request_${r.id}`)];
   });
@@ -926,19 +1255,19 @@ bot.action(/^view_request_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const requestId = parseInt(ctx.match[1]);
-  const requests = getAccessRequests();
+  const requests = await db.getAccessRequests();
   const request = requests.find(r => r.id === requestId);
 
   if (!request) {
     return ctx.answerCbQuery('Заявка не найдена');
   }
 
-  const name = [request.firstName, request.lastName].filter(Boolean).join(' ') || 'Без имени';
-  const userLink = request.username ? `@${request.username}` : `ID: ${request.userId}`;
-  const date = new Date(request.createdAt).toLocaleDateString('ru-RU');
+  const name = [request.first_name, request.last_name].filter(Boolean).join(' ') || 'Без имени';
+  const userLink = request.username ? `@${request.username}` : `ID: ${request.user_id}`;
+  const date = new Date(request.created_at).toLocaleDateString('ru-RU');
 
   // Получаем список компаний для выбора
-  const companies = Object.values(getCompanies());
+  const companies = Object.values(await db.getCompanies());
 
   const buttons = companies.map(c => [
     Markup.button.callback(`🏢 ${c.name}`, `approve_request_${requestId}_${c.id}`)
@@ -951,7 +1280,7 @@ bot.action(/^view_request_(\d+)$/, async ctx => {
     `📋 *Заявка*\n\n` +
     `👤 ${name}\n` +
     `📱 ${userLink}\n` +
-    `🆔 \`${request.userId}\`\n` +
+    `🆔 \`${request.user_id}\`\n` +
     `📅 ${date}\n\n` +
     (companies.length > 0 ? 'Выберите компанию:' : '⚠️ Сначала создайте компанию'),
     {
@@ -967,29 +1296,29 @@ bot.action(/^approve_request_(\d+)_(.+)$/, async ctx => {
   const requestId = parseInt(ctx.match[1]);
   const companyId = ctx.match[2];
 
-  const requests = getAccessRequests();
+  const requests = await db.getAccessRequests();
   const request = requests.find(r => r.id === requestId);
 
   if (!request) {
     return ctx.answerCbQuery('Заявка не найдена');
   }
 
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) {
     return ctx.answerCbQuery('Компания не найдена');
   }
 
-  const name = [request.firstName, request.lastName].filter(Boolean).join(' ') || 'Пользователь';
+  const name = [request.first_name, request.last_name].filter(Boolean).join(' ') || 'Пользователь';
 
   // Создаём пользователя
-  createUser(request.userId, companyId, name);
+  await db.createUser(request.user_id, companyId, name);
 
   // Удаляем заявку
-  deleteAccessRequest(requestId);
+  await db.deleteAccessRequest(requestId);
 
   // Уведомляем пользователя
   try {
-    await bot.telegram.sendMessage(request.userId,
+    await bot.telegram.sendMessage(request.user_id,
       `🎉 Ваша заявка одобрена!\n\n` +
       `🏢 Компания: ${company.name}\n\n` +
       `Отправьте /start чтобы начать.`
@@ -999,7 +1328,7 @@ bot.action(/^approve_request_(\d+)_(.+)$/, async ctx => {
   await ctx.answerCbQuery('Одобрено');
 
   // Возвращаемся к списку заявок
-  const remainingRequests = getAccessRequests();
+  const remainingRequests = await db.getAccessRequests();
   if (remainingRequests.length === 0) {
     await ctx.editMessageText('📋 *Заявки на доступ*\n\n✅ Все заявки обработаны', {
       parse_mode: 'Markdown',
@@ -1007,7 +1336,7 @@ bot.action(/^approve_request_(\d+)_(.+)$/, async ctx => {
     });
   } else {
     const buttons = remainingRequests.slice(0, 10).map(r => {
-      const n = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Без имени';
+      const n = [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Без имени';
       const tag = r.username ? `@${r.username}` : '';
       return [Markup.button.callback(`👤 ${n} ${tag}`, `view_request_${r.id}`)];
     });
@@ -1023,7 +1352,7 @@ bot.action(/^reject_request_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const requestId = parseInt(ctx.match[1]);
-  const requests = getAccessRequests();
+  const requests = await db.getAccessRequests();
   const request = requests.find(r => r.id === requestId);
 
   if (!request) {
@@ -1031,17 +1360,17 @@ bot.action(/^reject_request_(\d+)$/, async ctx => {
   }
 
   // Удаляем заявку
-  deleteAccessRequest(requestId);
+  await db.deleteAccessRequest(requestId);
 
   // Уведомляем пользователя
   try {
-    await bot.telegram.sendMessage(request.userId, '❌ Ваша заявка на доступ отклонена.');
+    await bot.telegram.sendMessage(request.user_id, '❌ Ваша заявка на доступ отклонена.');
   } catch (e) {}
 
   await ctx.answerCbQuery('Отклонено');
 
   // Возвращаемся к списку заявок
-  const remainingRequests = getAccessRequests();
+  const remainingRequests = await db.getAccessRequests();
   if (remainingRequests.length === 0) {
     await ctx.editMessageText('📋 *Заявки на доступ*\n\nНет новых заявок', {
       parse_mode: 'Markdown',
@@ -1049,7 +1378,7 @@ bot.action(/^reject_request_(\d+)$/, async ctx => {
     });
   } else {
     const buttons = remainingRequests.slice(0, 10).map(r => {
-      const n = [r.firstName, r.lastName].filter(Boolean).join(' ') || 'Без имени';
+      const n = [r.first_name, r.last_name].filter(Boolean).join(' ') || 'Без имени';
       const tag = r.username ? `@${r.username}` : '';
       return [Markup.button.callback(`👤 ${n} ${tag}`, `view_request_${r.id}`)];
     });
@@ -1066,13 +1395,14 @@ bot.action(/^reject_request_(\d+)$/, async ctx => {
 bot.action('admin_companies', async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
-  const companies = Object.values(getCompanies());
+  const companies = Object.values(await db.getCompanies());
 
-  const buttons = companies.slice(0, 10).map(c => {
-    const users = getCompanyUsers(c.id);
+  const buttons = [];
+  for (const c of companies.slice(0, 10)) {
+    const users = await db.getCompanyUsers(c.id);
     const totalBalance = users.reduce((sum, u) => sum + (u.balance || 0), 0);
-    return [Markup.button.callback(`🏢 ${c.name} (${users.length} чел, ${totalBalance}₽)`, `company_${c.id}`)];
-  });
+    buttons.push([Markup.button.callback(`🏢 ${c.name} (${users.length} чел, ${totalBalance}₽)`, `company_${c.id}`)]);
+  }
 
   buttons.push([Markup.button.callback('➕ Добавить компанию', 'add_company')]);
   buttons.push([Markup.button.callback('⬅️ Назад', 'admin')]);
@@ -1096,10 +1426,10 @@ bot.action(/^company_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
   const totalBalance = users.reduce((sum, u) => sum + (u.balance || 0), 0);
 
   let text = `🏢 *${company.name}*\n\n`;
@@ -1137,12 +1467,12 @@ bot.action(/^company_report_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
-  const users = getCompanyUsers(companyId);
-  const allGens = getAllGenerations();
-  const allTxs = getAllTransactions();
+  const users = await db.getCompanyUsers(companyId);
+  const allGens = await db.getAllGenerations();
+  const allTxs = await db.getAllTransactions();
 
   // Статистика по компании
   let totalGens = 0;
@@ -1151,8 +1481,8 @@ bot.action(/^company_report_(.+)$/, async ctx => {
   let totalBalance = 0;
 
   const userStats = users.map(u => {
-    const userGens = allGens.filter(g => g.userId == u.id);
-    const userTxs = allTxs.filter(t => t.userId == u.id);
+    const userGens = allGens.filter(g => g.user_id == u.id);
+    const userTxs = allTxs.filter(t => t.user_id == u.id);
     const spent = userGens.length * GENERATION_COST;
     const topups = userTxs.filter(t => t.type === 'topup').reduce((sum, t) => sum + t.amount, 0);
 
@@ -1202,10 +1532,10 @@ bot.action(/^send_report_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
 
   if (users.length === 0) {
     return ctx.answerCbQuery('Нет сотрудников');
@@ -1229,12 +1559,12 @@ bot.action(/^do_send_report_(.+)_(\d+)$/, async ctx => {
   const companyId = ctx.match[1];
   const recipientId = ctx.match[2];
 
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
-  const users = getCompanyUsers(companyId);
-  const allGens = getAllGenerations();
-  const allTxs = getAllTransactions();
+  const users = await db.getCompanyUsers(companyId);
+  const allGens = await db.getAllGenerations();
+  const allTxs = await db.getAllTransactions();
 
   // Формируем отчёт
   let totalGens = 0;
@@ -1242,7 +1572,7 @@ bot.action(/^do_send_report_(.+)_(\d+)$/, async ctx => {
   let totalBalance = 0;
 
   const userStats = users.map(u => {
-    const userGens = allGens.filter(g => g.userId == u.id);
+    const userGens = allGens.filter(g => g.user_id == u.id);
     const spent = userGens.length * GENERATION_COST;
 
     totalGens += userGens.length;
@@ -1292,7 +1622,7 @@ bot.action(/^rename_company_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const company = getCompany(companyId);
+  const company = await db.getCompany(companyId);
   if (!company) return ctx.answerCbQuery('Компания не найдена');
 
   const state = getState(ctx.from.id);
@@ -1331,7 +1661,7 @@ bot.action(/^manage_users_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
 
   const buttons = users.map(u => [
     Markup.button.callback(`${u.name || 'ID:' + u.id} (${u.balance}₽)`, `user_${u.id}`)
@@ -1346,10 +1676,11 @@ bot.action(/^user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  const gens = getAllGenerations().filter(g => g.userId == userId).length;
+  const allGens = await db.getAllGenerations();
+  const gens = allGens.filter(g => g.user_id == userId).length;
 
   await ctx.answerCbQuery();
   await ctx.editMessageText(
@@ -1361,7 +1692,7 @@ bot.action(/^user_(\d+)$/, async ctx => {
       ...Markup.inlineKeyboard([
         [Markup.button.callback('💳 Пополнить', `topup_user_${userId}`)],
         [Markup.button.callback('🗑 Удалить', `delete_user_${userId}`)],
-        [Markup.button.callback('⬅️ Назад', `manage_users_${user.companyId}`)]
+        [Markup.button.callback('⬅️ Назад', `manage_users_${user.company_id}`)]
       ])
     }
   );
@@ -1371,19 +1702,19 @@ bot.action(/^delete_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  const companyId = user.companyId;
-  deleteUser(userId);
+  const companyId = user.company_id;
+  await db.deleteUser(userId);
 
   await ctx.answerCbQuery('Удалён');
 
   // Возврат к списку сотрудников
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
   if (users.length === 0) {
     // Если сотрудников не осталось, возвращаемся к компании
-    const company = getCompany(companyId);
+    const company = await db.getCompany(companyId);
     await ctx.editMessageText(`🏢 *${company?.name}*\n\nСотрудников нет`, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -1406,7 +1737,7 @@ bot.action(/^topup_company_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
 
   if (users.length === 0) {
     return ctx.answerCbQuery('Нет сотрудников');
@@ -1425,7 +1756,7 @@ bot.action(/^topup_user_(\d+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const userId = ctx.match[1];
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
   const state = getState(ctx.from.id);
@@ -1458,11 +1789,11 @@ bot.action(/^do_topup_(\d+)$/, async ctx => {
 
   if (!userId) return ctx.answerCbQuery('Ошибка');
 
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   if (!user) return ctx.answerCbQuery('Пользователь не найден');
 
-  updateUser(userId, { balance: (user.balance || 0) + amount });
-  addTransaction(userId, amount, 'topup', 'Пополнение администратором');
+  await db.updateUser(userId, { balance: (user.balance || 0) + amount });
+  await db.addTransaction(userId, amount, 'topup', 'Пополнение администратором');
 
   try {
     await bot.telegram.sendMessage(userId, `💰 Ваш баланс пополнен на ${amount} ₽\n\nТекущий баланс: ${user.balance + amount} ₽`);
@@ -1482,8 +1813,8 @@ bot.action(/^delete_company_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const company = getCompany(companyId);
-  const users = getCompanyUsers(companyId);
+  const company = await db.getCompany(companyId);
+  const users = await db.getCompanyUsers(companyId);
 
   await ctx.answerCbQuery();
   await ctx.editMessageText(
@@ -1503,22 +1834,25 @@ bot.action(/^confirm_delete_company_(.+)$/, async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
   const companyId = ctx.match[1];
-  const users = getCompanyUsers(companyId);
+  const users = await db.getCompanyUsers(companyId);
 
   // Удаляем всех сотрудников
-  users.forEach(u => deleteUser(u.id));
+  for (const u of users) {
+    await db.deleteUser(u.id);
+  }
   // Удаляем компанию
-  deleteCompany(companyId);
+  await db.deleteCompany(companyId);
 
   await ctx.answerCbQuery('Компания удалена');
 
   // Возврат к списку компаний
-  const companies = Object.values(getCompanies());
-  const buttons = companies.slice(0, 10).map(c => {
-    const cUsers = getCompanyUsers(c.id);
+  const companies = Object.values(await db.getCompanies());
+  const buttons = [];
+  for (const c of companies.slice(0, 10)) {
+    const cUsers = await db.getCompanyUsers(c.id);
     const totalBalance = cUsers.reduce((sum, u) => sum + (u.balance || 0), 0);
-    return [Markup.button.callback(`🏢 ${c.name} (${cUsers.length} чел, ${totalBalance}₽)`, `company_${c.id}`)];
-  });
+    buttons.push([Markup.button.callback(`🏢 ${c.name} (${cUsers.length} чел, ${totalBalance}₽)`, `company_${c.id}`)]);
+  }
   buttons.push([Markup.button.callback('➕ Добавить компанию', 'add_company')]);
   buttons.push([Markup.button.callback('⬅️ Назад', 'admin')]);
 
@@ -1530,15 +1864,9 @@ bot.action(/^confirm_delete_company_(.+)$/, async ctx => {
 bot.action('admin_stats', async ctx => {
   if (!isAdmin(ctx.from.id)) return;
 
-  const data = loadData();
-  const today = new Date().toISOString().split('T')[0];
-  const todayGens = (data.generations || []).filter(g => g.createdAt?.startsWith(today)).length;
-  const todayRevenue = (data.transactions || [])
-    .filter(t => t.createdAt?.startsWith(today) && t.type === 'topup')
-    .reduce((sum, t) => sum + t.amount, 0);
-
-  const totalGens = (data.generations || []).length;
-  const totalRevenue = (data.transactions || [])
+  const stats = await db.getStats();
+  const allTransactions = await db.getAllTransactions();
+  const totalRevenue = allTransactions
     .filter(t => t.type === 'topup')
     .reduce((sum, t) => sum + t.amount, 0);
 
@@ -1546,10 +1874,10 @@ bot.action('admin_stats', async ctx => {
   await ctx.editMessageText(
     '📊 *Статистика*\n\n' +
     '*Сегодня:*\n' +
-    `🖼 Генераций: ${todayGens}\n` +
-    `💰 Пополнений: ${todayRevenue} ₽\n\n` +
+    `🖼 Генераций: ${stats.today_generations}\n` +
+    `💰 Пополнений: ${stats.today_topups} ₽\n\n` +
     '*Всего:*\n' +
-    `🖼 Генераций: ${totalGens}\n` +
+    `🖼 Генераций: ${stats.generations_count}\n` +
     `💰 Пополнений: ${totalRevenue} ₽`,
     {
       parse_mode: 'Markdown',
@@ -1562,7 +1890,7 @@ bot.action('admin_stats', async ctx => {
 
 bot.action('new_visual', async ctx => {
   const userId = ctx.from.id;
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
 
   if (!isAdmin(userId) && !user) {
     return ctx.answerCbQuery('Нет доступа');
@@ -1597,37 +1925,43 @@ bot.action('back_main', async ctx => {
   state.tempData = {};
   await ctx.answerCbQuery();
 
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
   let text = '🏠 *Визуализация натяжных потолков*\n\n';
+
+  const disclaimer = '💡 _Умная нейросеть создаёт визуализации за секунды — покажите клиенту будущий потолок прямо на встрече!\n\n⚠️ Любой ИИ может немного отклоняться от настроек: добавить 4 светильника вместо 2 или изменить оттенок — так устроены все нейросети в мире. Мы используем лучшие технологии и максимально точные промпты._';
 
   if (isAdmin(userId)) {
     text += '👑 Вы администратор\n\n';
+    text += disclaimer;
   } else if (user) {
-    const company = getCompany(user.companyId);
+    const company = await db.getCompany(user.company_id);
     text += `🏢 ${company?.name || 'Компания'}\n`;
     text += `💰 Баланс: ${user.balance} ₽\n\n`;
+    text += disclaimer;
   }
 
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', ...mainMenuKeyboard(userId) });
-  } catch (e) {
-    // Если сообщение с фото - отправляем новое
-    await ctx.reply(text, { parse_mode: 'Markdown', ...mainMenuKeyboard(userId) });
-  }
+  // Отправляем новое сообщение с постоянной клавиатурой
+  await ctx.reply(text, {
+    parse_mode: 'Markdown',
+    ...persistentKeyboard(isAdmin(userId))
+  });
 });
 
 // ============ ЗАГРУЗКА ФОТО ============
 
 bot.on('photo', async ctx => {
   const userId = ctx.from.id;
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
 
   if (!isAdmin(userId) && !user) {
     return ctx.reply('⚠️ У вас нет доступа. Обратитесь к администратору.');
   }
 
   if (!isAdmin(userId) && user.balance < GENERATION_COST) {
-    return ctx.reply(`❌ Недостаточно средств. Нужно ${GENERATION_COST} ₽`, mainMenuKeyboard(userId));
+    return ctx.reply(
+      `❌ Недостаточно средств. Нужно ${GENERATION_COST} ₽`,
+      Markup.inlineKeyboard([[Markup.button.callback('💳 Пополнить', 'pay_balance')]])
+    );
   }
 
   const state = getState(userId);
@@ -1646,7 +1980,7 @@ bot.on('photo', async ctx => {
     });
   } catch (e) {
     console.error(e);
-    ctx.reply('❌ Ошибка загрузки фото');
+    await ctx.reply('❌ Ошибка загрузки фото');
   }
 });
 
@@ -1659,7 +1993,7 @@ bot.on('text', async ctx => {
 
   // Добавление компании
   if (state.step === 'add_company_name' && isAdmin(userId)) {
-    const company = addCompany(text);
+    const company = await db.addCompany(text);
     state.step = null;
 
     return ctx.reply(`✅ Компания "${text}" создана`,
@@ -1675,7 +2009,7 @@ bot.on('text', async ctx => {
     const companyId = state.tempData.renameCompanyId;
     const newName = text.trim();
 
-    updateCompany(companyId, { name: newName });
+    await db.updateCompany(companyId, { name: newName });
     state.step = null;
     state.tempData = {};
 
@@ -1692,7 +2026,7 @@ bot.on('text', async ctx => {
       return ctx.reply('❌ ID должен содержать только цифры. Попробуйте снова:');
     }
 
-    if (getUser(newUserId)) {
+    if (await db.getUser(newUserId)) {
       return ctx.reply('❌ Этот пользователь уже добавлен. Введите другой ID:');
     }
 
@@ -1708,13 +2042,13 @@ bot.on('text', async ctx => {
     const companyId = state.tempData.companyId;
     const name = text.trim();
 
-    createUser(newUserId, companyId, name);
+    await db.createUser(newUserId, companyId, name);
 
     state.step = null;
     state.tempData = {};
 
     try {
-      const company = getCompany(companyId);
+      const company = await db.getCompany(companyId);
       await bot.telegram.sendMessage(newUserId,
         `🎉 Вам предоставлен доступ к боту визуализации потолков!\n\n` +
         `🏢 Компания: ${company?.name}\n\n` +
@@ -1728,6 +2062,24 @@ bot.on('text', async ctx => {
       Markup.inlineKeyboard([[Markup.button.callback('⬅️ К компании', `company_${companyId}`)]])
     );
   }
+
+  // Сохранение избранной конфигурации
+  if (state.step === 'save_favorite_name') {
+    const name = text.trim().slice(0, 50); // ограничим 50 символами
+
+    await db.addFavorite(userId, name, state.config);
+    state.step = null;
+
+    return ctx.reply(
+      `✅ Конфигурация "${name}" сохранена в избранное!`,
+      {
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('⭐ Избранное', 'favorites')],
+          [Markup.button.callback('⬅️ К настройкам', 'back_config')]
+        ])
+      }
+    );
+  }
 });
 
 // Обработка пересланных сообщений для получения ID
@@ -1738,7 +2090,7 @@ bot.on('forward', async ctx => {
   if (state.step === 'add_user_id' && isAdmin(userId) && ctx.message.forward_from) {
     const forwardedUserId = ctx.message.forward_from.id.toString();
 
-    if (getUser(forwardedUserId)) {
+    if (await db.getUser(forwardedUserId)) {
       return ctx.reply('❌ Этот пользователь уже добавлен.');
     }
 
@@ -1750,25 +2102,290 @@ bot.on('forward', async ctx => {
   }
 });
 
+// ============ ПРЕСЕТЫ ============
+
+const PRESETS = {
+  minimalism: {
+    name: '🔲 Минимализм',
+    description: 'Чистые линии, никаких излишеств',
+    config: {
+      color: 'white',
+      texture: 'matte',
+      profile: { back: 'shadow', front: 'shadow', left: 'shadow', right: 'shadow' },
+      spots: { enabled: true, count: 4, type: 'round', color: 'white' },
+      chandelier: { enabled: false, style: 'modern' },
+      lightlines: { enabled: false, count: 1, direction: 'along', shape: 'straight' },
+      track: { enabled: false, color: 'black' },
+      ledStrip: { enabled: false, color: 'warm' },
+      niche: false,
+      twoLevel: false
+    }
+  },
+  classic: {
+    name: '🏛 Классика',
+    description: 'Элегантно с люстрой',
+    config: {
+      color: 'ivory',
+      texture: 'satin',
+      profile: { back: 'none', front: 'none', left: 'none', right: 'none' },
+      spots: { enabled: false, count: 6, type: 'round', color: 'gold' },
+      chandelier: { enabled: true, style: 'classic' },
+      lightlines: { enabled: false, count: 1, direction: 'along', shape: 'straight' },
+      track: { enabled: false, color: 'white' },
+      ledStrip: { enabled: true, color: 'warm' },
+      niche: true,
+      twoLevel: false
+    }
+  },
+  premium: {
+    name: '💎 Премиум',
+    description: 'Двухуровневый с подсветкой',
+    config: {
+      color: 'white',
+      texture: 'glossy',
+      profile: { back: 'floating', front: 'floating', left: 'floating', right: 'floating' },
+      spots: { enabled: true, count: 8, type: 'round', color: 'white' },
+      chandelier: { enabled: true, style: 'ring' },
+      lightlines: { enabled: false, count: 2, direction: 'along', shape: 'straight' },
+      track: { enabled: false, color: 'black' },
+      ledStrip: { enabled: true, color: 'warm' },
+      niche: true,
+      twoLevel: true
+    }
+  },
+  modern: {
+    name: '✨ Современный',
+    description: 'Световые линии и трек',
+    config: {
+      color: 'white',
+      texture: 'matte',
+      profile: { back: 'shadow', front: 'shadow', left: 'shadow', right: 'shadow' },
+      spots: { enabled: false, count: 6, type: 'round', color: 'black' },
+      chandelier: { enabled: false, style: 'minimalist' },
+      lightlines: { enabled: true, count: 3, direction: 'along', shape: 'straight' },
+      track: { enabled: true, color: 'black' },
+      ledStrip: { enabled: false, color: 'warm' },
+      niche: false,
+      twoLevel: false
+    }
+  },
+  loft: {
+    name: '🏭 Лофт',
+    description: 'Индустриальный стиль',
+    config: {
+      color: 'darkgray',
+      texture: 'matte',
+      profile: { back: 'none', front: 'none', left: 'none', right: 'none' },
+      spots: { enabled: false, count: 4, type: 'round', color: 'black' },
+      chandelier: { enabled: true, style: 'industrial' },
+      lightlines: { enabled: false, count: 1, direction: 'along', shape: 'straight' },
+      track: { enabled: true, color: 'black' },
+      ledStrip: { enabled: false, color: 'warm' },
+      niche: false,
+      twoLevel: false
+    }
+  }
+};
+
 // ============ МЕНЮ КОНФИГУРАЦИИ ============
 
 function configMenu(config) {
   return Markup.inlineKeyboard([
+    [Markup.button.callback('⚡ Пресеты', 'presets'), Markup.button.callback('⭐ Избранное', 'favorites')],
     [Markup.button.callback('🎨 Цвет', 'cfg_color'), Markup.button.callback('✨ Текстура', 'cfg_texture')],
     [Markup.button.callback('📐 Профили', 'cfg_profiles'), Markup.button.callback('🏗 Уровни', 'cfg_levels')],
     [Markup.button.callback('💡 Споты', 'cfg_spots'), Markup.button.callback('🪔 Люстра', 'cfg_chandelier')],
     [Markup.button.callback('📏 Линии', 'cfg_lightlines'), Markup.button.callback('🔦 Трек', 'cfg_track')],
     [Markup.button.callback('💫 LED', 'cfg_led'), Markup.button.callback('🪟 Ниша', 'cfg_niche')],
     [Markup.button.callback('✅ Сгенерировать', 'generate')],
+    [Markup.button.callback('💾 Сохранить', 'save_favorite'), Markup.button.callback('🗑 Удалить', 'manage_favorites')],
     [Markup.button.callback('🔄 Сброс', 'reset'), Markup.button.callback('⬅️ Меню', 'back_main')]
   ]);
 }
+
+// Меню пресетов
+bot.action('presets', async ctx => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '⚡ *Быстрые пресеты*\n\n' +
+    'Выберите готовый стиль потолка:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔲 Минимализм', 'preset_minimalism')],
+        [Markup.button.callback('🏛 Классика', 'preset_classic')],
+        [Markup.button.callback('💎 Премиум', 'preset_premium')],
+        [Markup.button.callback('✨ Современный', 'preset_modern')],
+        [Markup.button.callback('🏭 Лофт', 'preset_loft')],
+        [Markup.button.callback('⬅️ Назад', 'back_config')]
+      ])
+    }
+  );
+});
+
+bot.action(/^preset_(.+)$/, async ctx => {
+  const presetKey = ctx.match[1];
+  const preset = PRESETS[presetKey];
+
+  if (!preset) {
+    return ctx.answerCbQuery('Пресет не найден');
+  }
+
+  const state = getState(ctx.from.id);
+  state.config = JSON.parse(JSON.stringify(preset.config));
+
+  await ctx.answerCbQuery(`${preset.name} применён!`);
+  await ctx.editMessageText(
+    `✅ *${preset.name}*\n\n${preset.description}\n\n` + buildSummary(state.config),
+    { parse_mode: 'Markdown', ...configMenu(state.config) }
+  );
+});
 
 bot.action('reset', async ctx => {
   const state = getState(ctx.from.id);
   state.config = getDefaultConfig();
   await ctx.answerCbQuery('Сброшено');
   await ctx.editMessageText('⚙️ *Настройки*\n\n' + buildSummary(state.config), { parse_mode: 'Markdown', ...configMenu(state.config) });
+});
+
+// ============ ИЗБРАННОЕ ============
+
+bot.action('favorites', async ctx => {
+  const userId = ctx.from.id;
+  const favorites = await db.getFavorites(userId);
+
+  await ctx.answerCbQuery();
+
+  if (favorites.length === 0) {
+    await ctx.editMessageText(
+      '⭐ *Избранные конфигурации*\n\n' +
+      'У вас пока нет сохранённых конфигураций.\n\n' +
+      '_Сохраните текущие настройки, нажав "Сохранить в избранное" в меню настроек._',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'back_config')]])
+      }
+    );
+    return;
+  }
+
+  const buttons = favorites.slice(0, 10).map(fav => {
+    return [Markup.button.callback(`⭐ ${fav.name}`, `load_fav_${fav.id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Назад', 'back_config')]);
+
+  await ctx.editMessageText(
+    '⭐ *Избранные конфигурации*\n\n' +
+    'Выберите конфигурацию для загрузки:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+bot.action(/^load_fav_(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const favId = parseInt(ctx.match[1]);
+  const fav = await db.getFavorite(favId, userId);
+
+  if (!fav) {
+    return ctx.answerCbQuery('Конфигурация не найдена');
+  }
+
+  const state = getState(userId);
+  const config = typeof fav.config === 'string' ? JSON.parse(fav.config) : fav.config;
+  state.config = JSON.parse(JSON.stringify(config));
+
+  await ctx.answerCbQuery(`${fav.name} загружена!`);
+  await ctx.editMessageText(
+    `✅ Загружена: *${fav.name}*\n\n` + buildSummary(state.config),
+    { parse_mode: 'Markdown', ...configMenu(state.config) }
+  );
+});
+
+bot.action('save_favorite', async ctx => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  state.step = 'save_favorite_name';
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '⭐ *Сохранить в избранное*\n\n' +
+    'Введите название для этой конфигурации:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'back_config')]])
+    }
+  );
+});
+
+bot.action('manage_favorites', async ctx => {
+  const userId = ctx.from.id;
+  const favorites = await db.getFavorites(userId);
+
+  await ctx.answerCbQuery();
+
+  if (favorites.length === 0) {
+    await ctx.editMessageText(
+      '⭐ *Управление избранным*\n\nНет сохранённых конфигураций.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'back_config')]])
+      }
+    );
+    return;
+  }
+
+  const buttons = favorites.slice(0, 10).map(fav => {
+    return [Markup.button.callback(`🗑 ${fav.name}`, `del_fav_${fav.id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Назад', 'back_config')]);
+
+  await ctx.editMessageText(
+    '⭐ *Управление избранным*\n\n' +
+    'Нажмите для удаления:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+bot.action(/^del_fav_(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const favId = parseInt(ctx.match[1]);
+
+  await db.deleteFavorite(favId, userId);
+  await ctx.answerCbQuery('Удалено');
+
+  // Обновляем список
+  const favorites = await db.getFavorites(userId);
+
+  if (favorites.length === 0) {
+    await ctx.editMessageText(
+      '⭐ *Управление избранным*\n\nНет сохранённых конфигураций.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'back_config')]])
+      }
+    );
+    return;
+  }
+
+  const buttons = favorites.slice(0, 10).map(fav => {
+    return [Markup.button.callback(`🗑 ${fav.name}`, `del_fav_${fav.id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Назад', 'back_config')]);
+
+  await ctx.editMessageText(
+    '⭐ *Управление избранным*\n\n' +
+    'Нажмите для удаления:',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
 });
 
 // ============ ЦВЕТ ============
@@ -2226,10 +2843,36 @@ bot.action('back_config', async ctx => {
 
 // ============ ГЕНЕРАЦИЯ ============
 
+// Функция обновления статуса с прогрессом
+async function updateProgress(ctx, msgId, step, total = 4) {
+  const steps = [
+    '📤 Загружаю фото...',
+    '🎨 Анализирую помещение...',
+    '✨ Генерирую потолок...',
+    '🖼 Обрабатываю результат...'
+  ];
+  const progress = '▓'.repeat(step) + '░'.repeat(total - step);
+  const text = `${steps[step - 1]}\n\n[${progress}] ${Math.round(step / total * 100)}%`;
+
+  try {
+    await ctx.telegram.editMessageText(ctx.chat.id, msgId, null, text);
+  } catch (e) {}
+}
+
+// Сохранение последней генерации для перегенерации
+function saveLastGeneration(userId, config, resultUrl) {
+  const state = getState(userId);
+  state.lastGeneration = {
+    config: JSON.parse(JSON.stringify(config)),
+    resultUrl,
+    timestamp: Date.now()
+  };
+}
+
 bot.action('generate', async ctx => {
   const userId = ctx.from.id;
   const state = getState(userId);
-  const user = getUser(userId);
+  const user = await db.getUser(userId);
 
   if (!state.photo) {
     return ctx.answerCbQuery('Сначала загрузите фото');
@@ -2251,41 +2894,67 @@ bot.action('generate', async ctx => {
   state.processing = true;
   await ctx.answerCbQuery();
 
-  const statusMsg = await ctx.reply('⏳ Обработка...');
+  const statusMsg = await ctx.reply('📤 Загружаю фото...\n\n[░░░░] 0%');
 
   try {
-    const prompt = buildPrompt(state.config);
-    console.log(`[${userId}] Prompt: ${prompt}`);
+    // Шаг 1: Подготовка изображения
+    await updateProgress(ctx, statusMsg.message_id, 1);
 
     const resizedImage = await sharp(state.photo)
-      .resize(1024, 1024, { fit: 'inside' })
-      .jpeg({ quality: 90 })
+      .resize(1536, 1536, { fit: 'inside' })  // Увеличили разрешение для лучшего качества
+      .jpeg({ quality: 95 })  // Повысили качество
       .toBuffer();
 
     const base64Image = `data:image/jpeg;base64,${resizedImage.toString('base64')}`;
 
-    const output = await replicate.run("google/nano-banana", {
-      input: { prompt, image_input: [base64Image] }
+    // Шаг 2: Анализ
+    await updateProgress(ctx, statusMsg.message_id, 2);
+
+    const prompt = buildPrompt(state.config);
+    console.log(`[${userId}] Prompt: ${prompt}`);
+
+    // Шаг 3: Генерация
+    await updateProgress(ctx, statusMsg.message_id, 3);
+
+    const output = await replicate.run("black-forest-labs/flux-kontext-max", {
+      input: {
+        prompt,
+        input_image: base64Image,
+        aspect_ratio: "match_input_image",
+        safety_tolerance: 6,
+        output_format: "jpg",
+        output_quality: 95
+      }
     });
+
+    // Шаг 4: Обработка результата
+    await updateProgress(ctx, statusMsg.message_id, 4);
 
     const resultUrl = Array.isArray(output) ? output[0] : output;
     console.log(`[${userId}] Done: ${resultUrl}`);
 
     // Списание (кроме админов)
     if (!isAdmin(userId) && user) {
-      updateUser(userId, { balance: user.balance - GENERATION_COST });
-      addTransaction(userId, -GENERATION_COST, 'generation', 'Генерация визуализации');
+      await db.updateUser(userId, { balance: user.balance - GENERATION_COST });
+      await db.addTransaction(userId, -GENERATION_COST, 'generation', 'Генерация визуализации');
     }
 
-    addGeneration(userId, state.config);
+    // Сохраняем генерацию с URL результата
+    await db.addGeneration(userId, state.config, resultUrl);
+    saveLastGeneration(userId, state.config, resultUrl);
 
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
+    const newBalance = isAdmin(userId) ? '∞' : (user.balance - GENERATION_COST);
+
     await ctx.replyWithPhoto({ url: resultUrl }, {
-      caption: '✅ *Готово*\n\n' + buildSummary(state.config),
+      caption: '✅ *Готово!*\n\n' + buildSummary(state.config) +
+        `\n\n💰 Баланс: ${newBalance} ₽` +
+        '\n\n💡 _Покажите клиенту — пусть оценит будущий потолок!_',
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Изменить', 'back_config')],
+        [Markup.button.callback('🔄 Перегенерировать (75₽)', 'regenerate')],
+        [Markup.button.callback('⚙️ Изменить настройки', 'back_config')],
         [Markup.button.callback('📸 Новое фото', 'new_visual')],
         [Markup.button.callback('🏠 Меню', 'back_main')]
       ])
@@ -2294,13 +2963,415 @@ bot.action('generate', async ctx => {
   } catch (e) {
     console.error(`[${userId}] Error:`, e.message || e);
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    await ctx.reply('❌ Ошибка генерации. Попробуйте снова или выберите другие настройки.',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Попробовать снова', 'generate')],
+        [Markup.button.callback('⚙️ Изменить настройки', 'back_config')],
+        [Markup.button.callback('🏠 Меню', 'back_main')]
+      ])
+    );
+  } finally {
+    state.processing = false;
+  }
+});
+
+// Перегенерация с теми же настройками
+bot.action('regenerate', async ctx => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  const user = await db.getUser(userId);
+
+  if (!state.photo) {
+    await ctx.answerCbQuery();
+    return ctx.reply(
+      '📸 *Фото не найдено*\n\n' +
+      'Для перегенерации нужно загрузить фото заново.\n' +
+      '_Это происходит после перезапуска бота или долгого перерыва._',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('📸 Загрузить фото', 'new_visual')],
+          [Markup.button.callback('🏠 Меню', 'back_main')]
+        ])
+      }
+    );
+  }
+
+  if (state.processing) {
+    return ctx.answerCbQuery('Подождите...');
+  }
+
+  // Проверка доступа
+  if (!isAdmin(userId)) {
+    if (!user) return ctx.answerCbQuery('Нет доступа');
+    if (user.balance < GENERATION_COST) {
+      return ctx.answerCbQuery(`Недостаточно средств. Нужно ${GENERATION_COST} ₽`);
+    }
+  }
+
+  state.processing = true;
+  await ctx.answerCbQuery('Генерирую новый вариант...');
+
+  const statusMsg = await ctx.reply('🔄 Генерирую новый вариант...\n\n[░░░░] 0%');
+
+  try {
+    await updateProgress(ctx, statusMsg.message_id, 1);
+
+    const resizedImage = await sharp(state.photo)
+      .resize(1536, 1536, { fit: 'inside' })
+      .jpeg({ quality: 95 })
+      .toBuffer();
+
+    const base64Image = `data:image/jpeg;base64,${resizedImage.toString('base64')}`;
+
+    await updateProgress(ctx, statusMsg.message_id, 2);
+
+    const prompt = buildPrompt(state.config);
+
+    await updateProgress(ctx, statusMsg.message_id, 3);
+
+    const output = await replicate.run("black-forest-labs/flux-kontext-max", {
+      input: {
+        prompt,
+        input_image: base64Image,
+        aspect_ratio: "match_input_image",
+        safety_tolerance: 6,
+        output_format: "jpg",
+        output_quality: 95
+      }
+    });
+
+    await updateProgress(ctx, statusMsg.message_id, 4);
+
+    const resultUrl = Array.isArray(output) ? output[0] : output;
+
+    if (!isAdmin(userId) && user) {
+      await db.updateUser(userId, { balance: user.balance - GENERATION_COST });
+      await db.addTransaction(userId, -GENERATION_COST, 'generation', 'Перегенерация');
+    }
+
+    await db.addGeneration(userId, state.config, resultUrl);
+    saveLastGeneration(userId, state.config, resultUrl);
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+
+    const newBalance = isAdmin(userId) ? '∞' : (user.balance - GENERATION_COST);
+
+    await ctx.replyWithPhoto({ url: resultUrl }, {
+      caption: '✅ *Новый вариант готов!*\n\n' + buildSummary(state.config) +
+        `\n\n💰 Баланс: ${newBalance} ₽`,
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Ещё вариант (75₽)', 'regenerate')],
+        [Markup.button.callback('⚙️ Изменить настройки', 'back_config')],
+        [Markup.button.callback('📸 Новое фото', 'new_visual')],
+        [Markup.button.callback('🏠 Меню', 'back_main')]
+      ])
+    });
+
+  } catch (e) {
+    console.error(`[${userId}] Regenerate error:`, e.message || e);
+    await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
     await ctx.reply('❌ Ошибка. Попробуйте снова.');
   } finally {
     state.processing = false;
   }
 });
 
+// ============ YOOKASSA ПЛАТЕЖИ ============
+
+// Создание платежа в YooKassa
+async function createYooKassaPayment(userId, amount, generations, paymentType, distribution = null) {
+  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
+    console.log('YooKassa not configured, using test mode');
+    return null;
+  }
+
+  const idempotenceKey = uuidv4();
+  const paymentId = uuidv4();
+
+  const paymentData = {
+    amount: {
+      value: amount.toFixed(2),
+      currency: 'RUB'
+    },
+    capture: true,
+    confirmation: {
+      type: 'redirect',
+      return_url: `https://t.me/${process.env.BOT_USERNAME || 'potolki_ai_bot'}`
+    },
+    description: `Пополнение баланса: ${generations} генераций`,
+    metadata: {
+      userId: userId.toString(),
+      generations: generations,
+      paymentType: paymentType,
+      distribution: distribution ? JSON.stringify(distribution) : null
+    }
+  };
+
+  try {
+    const response = await axios.post(
+      'https://api.yookassa.ru/v3/payments',
+      paymentData,
+      {
+        auth: {
+          username: YOOKASSA_SHOP_ID,
+          password: YOOKASSA_SECRET_KEY
+        },
+        headers: {
+          'Idempotence-Key': idempotenceKey,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Сохраняем информацию о платеже
+    pendingPayments.set(response.data.id, {
+      oderId: paymentId,
+      userId: userId,
+      amount: amount,
+      generations: generations,
+      paymentType: paymentType,
+      distribution: distribution,
+      createdAt: new Date().toISOString()
+    });
+
+    return response.data;
+  } catch (error) {
+    console.error('YooKassa payment error:', error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Webhook для получения уведомлений от YooKassa
+app.post('/yookassa-webhook', async (req, res) => {
+  try {
+    const notification = req.body;
+
+    if (notification.event === 'payment.succeeded') {
+      const payment = notification.object;
+      const metadata = payment.metadata;
+
+      if (metadata && metadata.userId) {
+        const userId = parseInt(metadata.userId);
+        const generations = parseInt(metadata.generations);
+        const amount = parseFloat(payment.amount.value);
+        const paymentType = metadata.paymentType;
+
+        if (paymentType === 'company' && metadata.distribution) {
+          // Распределение по сотрудникам
+          const distribution = JSON.parse(metadata.distribution);
+
+          for (const [empId, gens] of Object.entries(distribution)) {
+            const empUser = await db.getUser(empId);
+            if (empUser) {
+              const addAmount = gens * GENERATION_COST;
+              await db.updateUser(empId, { balance: (empUser.balance || 0) + addAmount });
+              await db.addTransaction(empId, addAmount, 'topup', 'Пополнение от компании');
+
+              try {
+                await bot.telegram.sendMessage(empId,
+                  `💰 Ваш баланс пополнен на ${addAmount} ₽ (${gens} генераций)\n\nТекущий баланс: ${empUser.balance + addAmount} ₽`
+                );
+              } catch (e) {}
+            }
+          }
+
+          // Уведомляем плательщика
+          try {
+            await bot.telegram.sendMessage(userId,
+              `✅ Оплата ${amount} ₽ прошла успешно!\n\n` +
+              `Средства распределены между сотрудниками.`
+            );
+          } catch (e) {}
+        } else {
+          // Личное пополнение
+          const user = await db.getUser(userId);
+          if (user) {
+            const genAmount = generations * GENERATION_COST;
+            await db.updateUser(userId, { balance: (user.balance || 0) + genAmount });
+            await db.addTransaction(userId, genAmount, 'topup', 'Пополнение через YooKassa');
+
+            try {
+              await bot.telegram.sendMessage(userId,
+                `✅ Оплата ${amount} ₽ прошла успешно!\n\n` +
+                `💰 Баланс пополнен на ${genAmount} ₽\n` +
+                `🖼 Доступно генераций: ${Math.floor((user.balance + genAmount) / GENERATION_COST)}`
+              );
+            } catch (e) {}
+          }
+        }
+
+        // Удаляем из ожидающих
+        pendingPayments.delete(payment.id);
+      }
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).send('Error');
+  }
+});
+
+// Проверка статуса платежа
+app.get('/payment-status/:paymentId', async (req, res) => {
+  const { paymentId } = req.params;
+  const pending = pendingPayments.get(paymentId);
+
+  if (pending) {
+    res.json({ status: 'pending', ...pending });
+  } else {
+    res.json({ status: 'unknown' });
+  }
+});
+
+// ============ КНОПКА ОПЛАТЫ ============
+
+bot.action('pay_balance', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user && !isAdmin(userId)) {
+    return ctx.answerCbQuery('Нет доступа');
+  }
+
+  await ctx.answerCbQuery();
+
+  // Показываем информацию об оплате
+  let text = '💳 *Пополнение баланса*\n\n';
+  text += `📊 Стоимость 1 генерации: ${GENERATION_COST} ₽\n\n`;
+
+  if (user) {
+    text += `💰 Ваш баланс: ${user.balance || 0} ₽\n`;
+    text += `🖼 Доступно генераций: ${Math.floor((user.balance || 0) / GENERATION_COST)}\n\n`;
+  }
+
+  text += '📋 *Тарифы:*\n';
+  text += '• 1 генерация — 75 ₽\n';
+  text += '• 5 генераций — 375 ₽\n';
+  text += '• 10 генераций — 750 ₽\n';
+  text += '• 20 генераций — 1 500 ₽\n';
+  text += '• 40 генераций — 3 000 ₽\n\n';
+
+  const buttons = [];
+
+  if (YOOKASSA_SHOP_ID && YOOKASSA_SECRET_KEY && PAYMENT_WEBHOOK_URL) {
+    // YooKassa настроена - показываем WebApp
+    const webAppUrl = PAYMENT_WEBHOOK_URL.replace('/yookassa-webhook', '/payment.html');
+
+    // Проверяем, есть ли у пользователя сотрудники (для компании)
+    let startParam = '';
+    if (user) {
+      const companyUsers = await db.getCompanyUsers(user.company_id).filter(u => u.id != userId);
+      if (companyUsers.length > 0) {
+        const employeesData = companyUsers.map(u => ({ id: u.id.toString(), name: u.name || 'Сотрудник' }));
+        startParam = Buffer.from(JSON.stringify({ employees: employeesData })).toString('base64');
+      }
+    }
+
+    text += '✅ Оплата через YooKassa';
+    buttons.push([Markup.button.webApp('💳 Перейти к оплате', webAppUrl + (startParam ? `?data=${startParam}` : ''))]);
+  } else {
+    // YooKassa не настроена - показываем быстрые кнопки для тестирования
+    text += '⚠️ _Система оплаты в процессе настройки_\n';
+    text += 'Выберите сумму для создания счёта:';
+
+    buttons.push([
+      Markup.button.callback('375 ₽ (5 ген.)', 'create_invoice_375'),
+      Markup.button.callback('750 ₽ (10 ген.)', 'create_invoice_750')
+    ]);
+    buttons.push([
+      Markup.button.callback('1500 ₽ (20 ген.)', 'create_invoice_1500'),
+      Markup.button.callback('3000 ₽ (40 ген.)', 'create_invoice_3000')
+    ]);
+  }
+
+  buttons.push([Markup.button.callback('⬅️ Назад', 'back_main')]);
+
+  try {
+    await ctx.editMessageText(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    });
+  } catch (e) {
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    });
+  }
+});
+
+// Обработка создания счёта (тестовый режим)
+bot.action(/^create_invoice_(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const amount = parseInt(ctx.match[1]);
+  const generations = Math.floor(amount / GENERATION_COST);
+
+  await ctx.answerCbQuery();
+
+  await ctx.editMessageText(
+    `📝 *Счёт на оплату*\n\n` +
+    `💰 Сумма: ${amount} ₽\n` +
+    `🖼 Генераций: ${generations}\n\n` +
+    `⚠️ _Для подключения онлайн-оплаты необходимо настроить YooKassa_\n\n` +
+    `Для ручного пополнения обратитесь к администратору.`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('⬅️ Назад', 'pay_balance')]
+      ])
+    }
+  );
+});
+
+// Обработка данных из WebApp
+bot.on('web_app_data', async ctx => {
+  try {
+    const data = JSON.parse(ctx.message.web_app_data.data);
+    const userId = ctx.from.id;
+
+    if (data.action === 'payment') {
+      const { amount, generations, type, distribution } = data;
+
+      // Создаём платёж в YooKassa
+      const payment = await createYooKassaPayment(userId, amount, generations, type, distribution);
+
+      if (payment && payment.confirmation?.confirmation_url) {
+        await ctx.reply(
+          `💳 *Оплата ${amount} ₽*\n\n` +
+          `🖼 Генераций: ${generations}\n\n` +
+          'Нажмите кнопку для перехода к оплате:',
+          {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+              [Markup.button.url('💳 Перейти к оплате', payment.confirmation.confirmation_url)],
+              [Markup.button.callback('❌ Отмена', 'back_main')]
+            ])
+          }
+        );
+      } else {
+        // Тестовый режим или ошибка
+        await ctx.reply(
+          '⚠️ Система оплаты временно недоступна.\n\n' +
+          'Обратитесь к администратору для пополнения баланса.',
+          persistentKeyboard(isAdmin(userId))
+        );
+      }
+    }
+  } catch (error) {
+    console.error('WebApp data error:', error);
+    await ctx.reply('❌ Ошибка обработки платежа');
+  }
+});
+
 // ============ ЗАПУСК ============
+
+// Запуск Express сервера
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`🌐 Webhook сервер запущен на порту ${PORT}`);
+});
 
 bot.launch().then(() => {
   console.log('🚀 Бот запущен');

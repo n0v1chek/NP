@@ -1,0 +1,554 @@
+{
+  "companies": {},
+  "users": {},
+  "transactions": [],
+  "generations": [
+    {
+      "id": 1765091448026,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "none",
+          "front": "shadow",
+          "left": "none",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T07:10:48.026Z"
+    },
+    {
+      "id": 1765094614130,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "none",
+          "front": "shadow",
+          "left": "none",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T08:03:34.130Z"
+    },
+    {
+      "id": 1765094980839,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "floating",
+          "front": "floating",
+          "left": "floating",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T08:09:40.839Z"
+    },
+    {
+      "id": 1765095013669,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "shadow",
+          "front": "shadow",
+          "left": "shadow",
+          "right": "shadow"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T08:10:13.669Z"
+    },
+    {
+      "id": 1765096977514,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "shadow",
+          "front": "shadow",
+          "left": "shadow",
+          "right": "shadow"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T08:42:57.514Z"
+    },
+    {
+      "id": 1765097917845,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "shadow",
+          "front": "none",
+          "left": "none",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": false,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": true,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T08:58:37.845Z"
+    },
+    {
+      "id": 1765129194358,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "floating",
+          "front": "floating",
+          "left": "floating",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 6,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T17:39:54.358Z"
+    },
+    {
+      "id": 1765129238810,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "floating",
+          "front": "floating",
+          "left": "floating",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T17:40:38.810Z"
+    },
+    {
+      "id": 1765129316879,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "shadow",
+          "front": "none",
+          "left": "none",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T17:41:56.879Z"
+    },
+    {
+      "id": 1765129368611,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "matte",
+        "profile": {
+          "back": "shadow",
+          "front": "none",
+          "left": "none",
+          "right": "floating"
+        },
+        "spots": {
+          "enabled": false,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": true,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T17:42:48.611Z"
+    },
+    {
+      "id": 1765132325075,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "glossy",
+        "profile": {
+          "back": "shadow",
+          "front": "shadow",
+          "left": "shadow",
+          "right": "shadow"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": true,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T18:32:05.075Z"
+    },
+    {
+      "id": 1765132358001,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "glossy",
+        "profile": {
+          "back": "shadow",
+          "front": "shadow",
+          "left": "shadow",
+          "right": "shadow"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": true,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T18:32:38.001Z"
+    },
+    {
+      "id": 1765132381723,
+      "userId": 799677717,
+      "config": {
+        "color": "white",
+        "texture": "glossy",
+        "profile": {
+          "back": "shadow",
+          "front": "shadow",
+          "left": "shadow",
+          "right": "shadow"
+        },
+        "spots": {
+          "enabled": true,
+          "count": 4,
+          "type": "round",
+          "color": "white"
+        },
+        "chandelier": {
+          "enabled": false,
+          "style": "modern"
+        },
+        "lightlines": {
+          "enabled": false,
+          "count": 1,
+          "direction": "along",
+          "shape": "straight"
+        },
+        "track": {
+          "enabled": false,
+          "color": "black"
+        },
+        "ledStrip": {
+          "enabled": false,
+          "color": "warm"
+        },
+        "niche": false,
+        "twoLevel": false
+      },
+      "cost": 75,
+      "createdAt": "2025-12-07T18:33:01.723Z"
+    }
+  ],
+  "accessRequests": []
+}
