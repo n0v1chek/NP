@@ -142,10 +142,10 @@ async function getUserTransactions(userId) {
 
 // ============ ГЕНЕРАЦИИ ============
 
-async function addGeneration(userId, config, resultUrl = null) {
+async function addGeneration(userId, config, resultUrl = null, costUsd = null) {
   const result = await pool.query(
-    'INSERT INTO generations (user_id, config, result_url) VALUES ($1, $2, $3) RETURNING *',
-    [userId, JSON.stringify(config), resultUrl]
+    'INSERT INTO generations (user_id, config, result_url, cost_usd) VALUES ($1, $2, $3, $4) RETURNING *',
+    [userId, JSON.stringify(config), resultUrl, costUsd]
   );
   return result.rows[0];
 }
@@ -239,6 +239,93 @@ async function getStats() {
   return result.rows[0];
 }
 
+// ============ СТАТИСТИКА РАСХОДОВ REPLICATE ============
+
+async function getCostStats(days = 30) {
+  // Внутренний курс компании для пополнения в доллары
+  const CBR_RATE = 140.0;
+
+  const result = await pool.query(`
+    SELECT
+      COUNT(*) as total_generations,
+      COALESCE(SUM(cost), 0) as total_revenue_rub,
+      COALESCE(SUM(cost_usd), 0) as total_cost_usd,
+      COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) as today_generations,
+      COALESCE(SUM(cost) FILTER (WHERE created_at::date = CURRENT_DATE), 0) as today_revenue_rub,
+      COALESCE(SUM(cost_usd) FILTER (WHERE created_at::date = CURRENT_DATE), 0) as today_cost_usd
+    FROM generations
+    WHERE created_at > NOW() - INTERVAL '1 day' * $1
+  `, [days]);
+
+  const row = result.rows[0];
+
+  const totalRevenueRub = parseFloat(row.total_revenue_rub) || 0;
+  const totalCostUsd = parseFloat(row.total_cost_usd) || 0;
+  const totalCostRub = totalCostUsd * CBR_RATE;
+  const totalProfitRub = totalRevenueRub - totalCostRub;
+  const marginPercent = totalCostRub > 0 ? ((totalRevenueRub - totalCostRub) / totalCostRub * 100) : 0;
+
+  const todayRevenueRub = parseFloat(row.today_revenue_rub) || 0;
+  const todayCostUsd = parseFloat(row.today_cost_usd) || 0;
+  const todayCostRub = todayCostUsd * CBR_RATE;
+  const todayProfitRub = todayRevenueRub - todayCostRub;
+
+  return {
+    period_days: days,
+    cbr_rate: CBR_RATE,
+    total: {
+      generations: parseInt(row.total_generations) || 0,
+      revenue_rub: Math.round(totalRevenueRub * 100) / 100,
+      cost_usd: Math.round(totalCostUsd * 10000) / 10000,
+      cost_rub: Math.round(totalCostRub * 100) / 100,
+      profit_rub: Math.round(totalProfitRub * 100) / 100,
+      margin_percent: Math.round(marginPercent * 10) / 10
+    },
+    today: {
+      generations: parseInt(row.today_generations) || 0,
+      revenue_rub: Math.round(todayRevenueRub * 100) / 100,
+      cost_usd: Math.round(todayCostUsd * 10000) / 10000,
+      cost_rub: Math.round(todayCostRub * 100) / 100,
+      profit_rub: Math.round(todayProfitRub * 100) / 100
+    }
+  };
+}
+
+async function getDailyCostStats(days = 30) {
+  // Внутренний курс компании для пополнения в доллары
+  const CBR_RATE = 140.0;
+
+  const result = await pool.query(`
+    SELECT
+      DATE(created_at) as date,
+      COUNT(*) as generations,
+      COALESCE(SUM(cost), 0) as revenue_rub,
+      COALESCE(SUM(cost_usd), 0) as cost_usd
+    FROM generations
+    WHERE created_at > NOW() - INTERVAL '1 day' * $1
+    GROUP BY DATE(created_at)
+    ORDER BY date DESC
+  `, [days]);
+
+  return result.rows.map(row => {
+    const revenueRub = parseFloat(row.revenue_rub) || 0;
+    const costUsd = parseFloat(row.cost_usd) || 0;
+    const costRub = costUsd * CBR_RATE;
+    const profitRub = revenueRub - costRub;
+    const margin = costRub > 0 ? ((revenueRub - costRub) / costRub * 100) : 0;
+
+    return {
+      date: row.date,
+      generations: parseInt(row.generations) || 0,
+      revenue_rub: Math.round(revenueRub * 100) / 100,
+      cost_usd: Math.round(costUsd * 10000) / 10000,
+      cost_rub: Math.round(costRub * 100) / 100,
+      profit_rub: Math.round(profitRub * 100) / 100,
+      margin_percent: Math.round(margin * 10) / 10
+    };
+  });
+}
+
 // ============ МИГРАЦИЯ ИЗ JSON ============
 
 async function migrateFromJson(jsonData) {
@@ -308,6 +395,501 @@ async function migrateFromJson(jsonData) {
   }
 }
 
+// ============ РЕГИСТРАЦИЯ (v2.0) ============
+
+async function registerIndividual(userId, name, username, phone = null) {
+  const result = await pool.query(
+    `INSERT INTO users (id, name, username, phone, user_type, balance)
+     VALUES ($1, $2, $3, $4, 'individual', 0)
+     ON CONFLICT (id) DO UPDATE SET name = $2, username = $3, phone = COALESCE($4, users.phone), user_type = 'individual'
+     RETURNING *`,
+    [userId, name, username, phone]
+  );
+  return result.rows[0];
+}
+
+async function registerCompanyOwner(userId, name, username, companyName, inn = null, description = null) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Создаём компанию
+    const companyResult = await client.query(
+      `INSERT INTO companies (name, owner_id, inn, description, shared_balance)
+       VALUES ($1, $2, $3, $4, 0) RETURNING *`,
+      [companyName, userId, inn, description]
+    );
+    const company = companyResult.rows[0];
+
+    // Создаём/обновляем пользователя как владельца
+    const userResult = await client.query(
+      `INSERT INTO users (id, name, username, company_id, user_type, balance)
+       VALUES ($1, $2, $3, $4, 'company_owner', 0)
+       ON CONFLICT (id) DO UPDATE SET
+         name = $2, username = $3, company_id = $4, user_type = 'company_owner'
+       RETURNING *`,
+      [userId, name, username, company.id]
+    );
+
+    await client.query('COMMIT');
+    return { user: userResult.rows[0], company };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ============ ПРИГЛАШЕНИЯ В КОМПАНИЮ ============
+
+async function inviteToCompany(companyId, invitedUserId, invitedBy) {
+  try {
+    const result = await pool.query(
+      `INSERT INTO company_invites (company_id, invited_user_id, invited_by, status)
+       VALUES ($1, $2, $3, 'pending') RETURNING *`,
+      [companyId, invitedUserId, invitedBy]
+    );
+    return result.rows[0];
+  } catch (e) {
+    if (e.code === '23505') return null; // Duplicate
+    throw e;
+  }
+}
+
+async function getPendingInvites(userId) {
+  const result = await pool.query(
+    `SELECT ci.*, c.name as company_name, c.owner_id
+     FROM company_invites ci
+     JOIN companies c ON ci.company_id = c.id
+     WHERE ci.invited_user_id = $1 AND ci.status = 'pending'
+     ORDER BY ci.created_at DESC`,
+    [userId]
+  );
+  return result.rows;
+}
+
+async function getCompanyInvites(companyId) {
+  const result = await pool.query(
+    `SELECT ci.*, u.name as invited_name, u.username as invited_username
+     FROM company_invites ci
+     LEFT JOIN users u ON ci.invited_user_id = u.id
+     WHERE ci.company_id = $1 AND ci.status = 'pending'
+     ORDER BY ci.created_at DESC`,
+    [companyId]
+  );
+  return result.rows;
+}
+
+async function acceptInvite(inviteId, userId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Получаем приглашение
+    const inviteResult = await client.query(
+      `SELECT * FROM company_invites WHERE id = $1 AND invited_user_id = $2 AND status = 'pending'`,
+      [inviteId, userId]
+    );
+    if (inviteResult.rows.length === 0) {
+      throw new Error('Приглашение не найдено');
+    }
+    const invite = inviteResult.rows[0];
+
+    // Обновляем статус приглашения
+    await client.query(
+      `UPDATE company_invites SET status = 'accepted', updated_at = NOW() WHERE id = $1`,
+      [inviteId]
+    );
+
+    // Обновляем пользователя
+    await client.query(
+      `UPDATE users SET company_id = $1, user_type = 'employee' WHERE id = $2`,
+      [invite.company_id, userId]
+    );
+
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function declineInvite(inviteId, userId) {
+  const result = await pool.query(
+    `UPDATE company_invites SET status = 'declined', updated_at = NOW()
+     WHERE id = $1 AND invited_user_id = $2 AND status = 'pending' RETURNING *`,
+    [inviteId, userId]
+  );
+  return result.rows[0];
+}
+
+async function cancelInvite(inviteId, companyId) {
+  const result = await pool.query(
+    `UPDATE company_invites SET status = 'cancelled', updated_at = NOW()
+     WHERE id = $1 AND company_id = $2 AND status = 'pending' RETURNING *`,
+    [inviteId, companyId]
+  );
+  return result.rows[0];
+}
+
+// ============ ПЕРЕДАЧА ПРАВ ВЛАДЕЛЬЦА ============
+
+async function requestOwnershipTransfer(companyId, fromUserId, toUserId) {
+  // Проверяем что toUserId - сотрудник этой компании
+  const userCheck = await pool.query(
+    `SELECT * FROM users WHERE id = $1 AND company_id = $2`,
+    [toUserId, companyId]
+  );
+  if (userCheck.rows.length === 0) {
+    throw new Error('Пользователь не является сотрудником компании');
+  }
+
+  const result = await pool.query(
+    `INSERT INTO ownership_transfers (company_id, from_user_id, to_user_id, status)
+     VALUES ($1, $2, $3, 'pending') RETURNING *`,
+    [companyId, fromUserId, toUserId]
+  );
+  return result.rows[0];
+}
+
+async function getPendingTransfer(userId) {
+  const result = await pool.query(
+    `SELECT ot.*, c.name as company_name, u.name as from_user_name
+     FROM ownership_transfers ot
+     JOIN companies c ON ot.company_id = c.id
+     JOIN users u ON ot.from_user_id = u.id
+     WHERE ot.to_user_id = $1 AND ot.status = 'pending'
+     ORDER BY ot.created_at DESC LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0];
+}
+
+async function acceptOwnershipTransfer(transferId, toUserId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Получаем запрос на передачу
+    const transferResult = await client.query(
+      `SELECT * FROM ownership_transfers WHERE id = $1 AND to_user_id = $2 AND status = 'pending'`,
+      [transferId, toUserId]
+    );
+    if (transferResult.rows.length === 0) {
+      throw new Error('Запрос не найден');
+    }
+    const transfer = transferResult.rows[0];
+
+    // Обновляем статус запроса
+    await client.query(
+      `UPDATE ownership_transfers SET status = 'accepted', updated_at = NOW() WHERE id = $1`,
+      [transferId]
+    );
+
+    // Меняем владельца компании
+    await client.query(
+      `UPDATE companies SET owner_id = $1 WHERE id = $2`,
+      [toUserId, transfer.company_id]
+    );
+
+    // Меняем роли пользователей
+    await client.query(
+      `UPDATE users SET user_type = 'employee' WHERE id = $1`,
+      [transfer.from_user_id]
+    );
+    await client.query(
+      `UPDATE users SET user_type = 'company_owner' WHERE id = $1`,
+      [toUserId]
+    );
+
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function declineOwnershipTransfer(transferId, toUserId) {
+  const result = await pool.query(
+    `UPDATE ownership_transfers SET status = 'declined', updated_at = NOW()
+     WHERE id = $1 AND to_user_id = $2 AND status = 'pending' RETURNING *`,
+    [transferId, toUserId]
+  );
+  return result.rows[0];
+}
+
+// ============ УДАЛЕНИЕ СОТРУДНИКА ИЗ КОМПАНИИ ============
+
+async function removeFromCompany(userId, companyId) {
+  const result = await pool.query(
+    `UPDATE users SET company_id = NULL, user_type = 'individual'
+     WHERE id = $1 AND company_id = $2 AND user_type = 'employee' RETURNING *`,
+    [userId, companyId]
+  );
+  return result.rows[0];
+}
+
+async function leaveCompany(userId) {
+  const result = await pool.query(
+    `UPDATE users SET company_id = NULL, user_type = 'individual'
+     WHERE id = $1 AND user_type = 'employee' RETURNING *`,
+    [userId]
+  );
+  return result.rows[0];
+}
+
+// ============ ПЛАТЕЖИ YOOKASSA ============
+
+async function createPayment(userId, amount, companyId = null, targetUserId = null, description = null) {
+  const result = await pool.query(
+    `INSERT INTO payments (user_id, amount, company_id, target_user_id, description, yookassa_status)
+     VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING *`,
+    [userId, amount, companyId, targetUserId, description]
+  );
+  return result.rows[0];
+}
+
+async function updatePaymentYookassa(paymentId, yookassaPaymentId, status, paymentMethod = null) {
+  const result = await pool.query(
+    `UPDATE payments SET
+       yookassa_payment_id = $2,
+       yookassa_status = $3,
+       payment_method = $4,
+       paid_at = CASE WHEN $3 = 'succeeded' THEN NOW() ELSE paid_at END
+     WHERE id = $1 RETURNING *`,
+    [paymentId, yookassaPaymentId, status, paymentMethod]
+  );
+  return result.rows[0];
+}
+
+async function getPaymentByYookassaId(yookassaPaymentId) {
+  const result = await pool.query(
+    `SELECT * FROM payments WHERE yookassa_payment_id = $1`,
+    [yookassaPaymentId]
+  );
+  return result.rows[0];
+}
+
+async function processSuccessfulPayment(paymentId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Получаем платёж
+    const paymentResult = await client.query(
+      `SELECT * FROM payments WHERE id = $1 AND yookassa_status = 'succeeded'`,
+      [paymentId]
+    );
+    if (paymentResult.rows.length === 0) {
+      throw new Error('Платёж не найден или не оплачен');
+    }
+    const payment = paymentResult.rows[0];
+
+    if (payment.company_id && !payment.target_user_id) {
+      // Пополнение общего счёта компании
+      await client.query(
+        `UPDATE companies SET shared_balance = shared_balance + $1 WHERE id = $2`,
+        [payment.amount, payment.company_id]
+      );
+      await client.query(
+        `INSERT INTO transactions (user_id, amount, type, description)
+         VALUES ($1, $2, 'topup', 'Пополнение общего счёта компании')`,
+        [payment.user_id, payment.amount]
+      );
+    } else if (payment.company_id && payment.target_user_id) {
+      // Пополнение счёта конкретного сотрудника
+      await client.query(
+        `UPDATE users SET balance = balance + $1 WHERE id = $2`,
+        [payment.amount, payment.target_user_id]
+      );
+      await client.query(
+        `INSERT INTO transactions (user_id, amount, type, description)
+         VALUES ($1, $2, 'topup', 'Пополнение от компании')`,
+        [payment.target_user_id, payment.amount]
+      );
+    } else {
+      // Пополнение личного счёта (частник)
+      await client.query(
+        `UPDATE users SET balance = balance + $1 WHERE id = $2`,
+        [payment.amount, payment.user_id]
+      );
+      await client.query(
+        `INSERT INTO transactions (user_id, amount, type, description)
+         VALUES ($1, $2, 'topup', 'Пополнение баланса')`,
+        [payment.user_id, payment.amount]
+      );
+    }
+
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function getUserPayments(userId, limit = 20) {
+  const result = await pool.query(
+    `SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [userId, limit]
+  );
+  return result.rows;
+}
+
+// ============ РАСПРЕДЕЛЕНИЕ БАЛАНСА ============
+
+async function distributeBalance(companyId, distributedBy, distribution) {
+  // distribution = { userId: amount, ... }
+  // Проверяем что суммы кратны 75
+  const amounts = Object.values(distribution);
+  for (const amount of amounts) {
+    if (amount % 75 !== 0) {
+      throw new Error('Суммы должны быть кратны 75');
+    }
+  }
+
+  const totalAmount = amounts.reduce((a, b) => a + b, 0);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Проверяем баланс компании
+    const companyResult = await client.query(
+      `SELECT shared_balance FROM companies WHERE id = $1 FOR UPDATE`,
+      [companyId]
+    );
+    if (companyResult.rows.length === 0) {
+      throw new Error('Компания не найдена');
+    }
+    if (companyResult.rows[0].shared_balance < totalAmount) {
+      throw new Error('Недостаточно средств на общем счёте');
+    }
+
+    // Списываем с общего счёта
+    await client.query(
+      `UPDATE companies SET shared_balance = shared_balance - $1 WHERE id = $2`,
+      [totalAmount, companyId]
+    );
+
+    // Начисляем каждому сотруднику
+    for (const [userId, amount] of Object.entries(distribution)) {
+      await client.query(
+        `UPDATE users SET balance = balance + $1 WHERE id = $2 AND company_id = $3`,
+        [amount, parseInt(userId), companyId]
+      );
+      await client.query(
+        `INSERT INTO transactions (user_id, amount, type, description)
+         VALUES ($1, $2, 'distribution', 'Распределение от компании')`,
+        [parseInt(userId), amount]
+      );
+    }
+
+    // Сохраняем историю распределения
+    await client.query(
+      `INSERT INTO balance_distributions (company_id, distributed_by, amount, distribution)
+       VALUES ($1, $2, $3, $4)`,
+      [companyId, distributedBy, totalAmount, JSON.stringify(distribution)]
+    );
+
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+async function distributeEvenly(companyId, distributedBy, totalAmount) {
+  // Получаем список сотрудников
+  const employeesResult = await pool.query(
+    `SELECT id FROM users WHERE company_id = $1`,
+    [companyId]
+  );
+  const employees = employeesResult.rows;
+
+  if (employees.length === 0) {
+    throw new Error('В компании нет сотрудников');
+  }
+
+  // Делим поровну, округляя до кратного 75
+  const perPerson = Math.floor(totalAmount / employees.length / 75) * 75;
+  if (perPerson < 75) {
+    throw new Error('Сумма слишком мала для распределения');
+  }
+
+  const distribution = {};
+  for (const emp of employees) {
+    distribution[emp.id] = perPerson;
+  }
+
+  return distributeBalance(companyId, distributedBy, distribution);
+}
+
+// ============ СТАТИСТИКА ДЛЯ КОМПАНИЙ ============
+
+async function getCompanyStats(companyId) {
+  const result = await pool.query(`
+    SELECT
+      c.id, c.name, c.shared_balance, c.owner_id,
+      (SELECT COUNT(*) FROM users WHERE company_id = $1) as employees_count,
+      (SELECT COALESCE(SUM(balance), 0) FROM users WHERE company_id = $1) as total_employee_balance,
+      (SELECT COUNT(*) FROM generations g JOIN users u ON g.user_id = u.id WHERE u.company_id = $1) as total_generations,
+      (SELECT COUNT(*) FROM generations g JOIN users u ON g.user_id = u.id WHERE u.company_id = $1 AND g.created_at::date = CURRENT_DATE) as today_generations
+    FROM companies c WHERE c.id = $1
+  `, [companyId]);
+  return result.rows[0];
+}
+
+async function getCompanyEmployeeStats(companyId) {
+  const result = await pool.query(`
+    SELECT
+      u.id, u.name, u.username, u.balance, u.user_type,
+      (SELECT COUNT(*) FROM generations WHERE user_id = u.id) as total_generations,
+      (SELECT COUNT(*) FROM generations WHERE user_id = u.id AND created_at::date = CURRENT_DATE) as today_generations,
+      (SELECT COALESCE(SUM(ABS(amount)), 0) FROM transactions WHERE user_id = u.id AND type = 'generation') as total_spent
+    FROM users u
+    WHERE u.company_id = $1
+    ORDER BY u.user_type DESC, u.name
+  `, [companyId]);
+  return result.rows;
+}
+
+async function getUserStats(userId) {
+  const result = await pool.query(`
+    SELECT
+      u.*,
+      c.name as company_name, c.shared_balance as company_balance,
+      (SELECT COUNT(*) FROM generations WHERE user_id = $1) as total_generations,
+      (SELECT COUNT(*) FROM generations WHERE user_id = $1 AND created_at::date = CURRENT_DATE) as today_generations,
+      (SELECT COALESCE(SUM(ABS(amount)), 0) FROM transactions WHERE user_id = $1 AND type = 'generation') as total_spent,
+      (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = $1 AND type = 'topup') as total_topups
+    FROM users u
+    LEFT JOIN companies c ON u.company_id = c.id
+    WHERE u.id = $1
+  `, [userId]);
+  return result.rows[0];
+}
+
+async function getCompanyByOwner(ownerId) {
+  const result = await pool.query(
+    `SELECT * FROM companies WHERE owner_id = $1`,
+    [ownerId]
+  );
+  return result.rows[0];
+}
+
 module.exports = {
   pool,
   getCompanies,
@@ -337,5 +919,33 @@ module.exports = {
   deleteFavorite,
   getFavorite,
   getStats,
-  migrateFromJson
+  getCostStats,
+  getDailyCostStats,
+  migrateFromJson,
+  // v2.0 - Компании и оплата
+  registerIndividual,
+  registerCompanyOwner,
+  inviteToCompany,
+  getPendingInvites,
+  getCompanyInvites,
+  acceptInvite,
+  declineInvite,
+  cancelInvite,
+  requestOwnershipTransfer,
+  getPendingTransfer,
+  acceptOwnershipTransfer,
+  declineOwnershipTransfer,
+  removeFromCompany,
+  leaveCompany,
+  createPayment,
+  updatePaymentYookassa,
+  getPaymentByYookassaId,
+  processSuccessfulPayment,
+  getUserPayments,
+  distributeBalance,
+  distributeEvenly,
+  getCompanyStats,
+  getCompanyEmployeeStats,
+  getUserStats,
+  getCompanyByOwner
 };

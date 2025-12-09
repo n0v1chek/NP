@@ -13,12 +13,15 @@ const ADMIN_IDS = process.env.ADMIN_IDS?.split(',').map(id => parseInt(id.trim()
 // PostgreSQL database
 const db = require('./db');
 
-const GENERATION_COST = 75; // 75 RUB за генерацию, маржа ~94%
+// YooKassa интеграция
+const { createYooKassaPayment, getYooKassaPaymentStatus, parseYooKassaWebhook, TOPUP_AMOUNTS } = require('./yookassa');
+
+const GENERATION_COST = 75; // 75 RUB за генерацию
 
 // YooKassa конфигурация
-const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID;
+const YOOKASSA_SHOP_ID = process.env.YOOKASSA_SHOP_ID || '1222788';
 const YOOKASSA_SECRET_KEY = process.env.YOOKASSA_SECRET_KEY;
-const PAYMENT_WEBHOOK_URL = process.env.PAYMENT_WEBHOOK_URL;
+const BOT_URL = process.env.BOT_URL || 'https://t.me/potolki_ai_bot';
 
 // Express сервер для webhook YooKassa
 const app = express();
@@ -234,7 +237,7 @@ function buildSummary(config) {
 // ============ ГЛАВНОЕ МЕНЮ ============
 
 // Постоянная клавиатура внизу экрана
-function persistentKeyboard(isAdminUser) {
+function persistentKeyboard(isAdminUser, user = null) {
   if (isAdminUser) {
     return Markup.keyboard([
       ['📸 Новая визуализация', '🖼 Мои работы'],
@@ -242,6 +245,25 @@ function persistentKeyboard(isAdminUser) {
       ['📖 Помощь']
     ]).resize();
   }
+
+  if (user?.user_type === 'company_owner') {
+    return Markup.keyboard([
+      ['📸 Новая визуализация', '🖼 Мои работы'],
+      ['💰 Баланс', '💳 Пополнить'],
+      ['🏢 Моя компания', '📊 Статистика'],
+      ['📖 Помощь']
+    ]).resize();
+  }
+
+  if (user?.user_type === 'employee') {
+    return Markup.keyboard([
+      ['📸 Новая визуализация', '🖼 Мои работы'],
+      ['💰 Баланс', '📊 Статистика'],
+      ['📖 Помощь']
+    ]).resize();
+  }
+
+  // individual
   return Markup.keyboard([
     ['📸 Новая визуализация', '🖼 Мои работы'],
     ['💰 Баланс', '💳 Пополнить'],
@@ -274,72 +296,87 @@ bot.command('start', async ctx => {
   const userId = ctx.from.id;
   const user = await db.getUser(userId);
 
-  let text = '🏠 *Визуализация натяжных потолков*\n\n';
-
-  const disclaimer = '💡 _Умная нейросеть создаёт визуализации за секунды — покажите клиенту будущий потолок прямо на встрече!\n\n⚠️ Любой ИИ может немного отклоняться от настроек: добавить 4 светильника вместо 2 или изменить оттенок — так устроены все нейросети в мире. Мы используем лучшие технологии и максимально точные промпты._';
+  const disclaimer = '💡 _Умная нейросеть создаёт визуализации за секунды — покажите клиенту будущий потолок прямо на встрече!_';
 
   if (isAdmin(userId)) {
+    let text = '🏠 *Визуализация натяжных потолков*\n\n';
     text += '👑 Вы администратор\n\n';
     text += disclaimer;
-  } else if (user) {
-    const company = await db.getCompany(user.company_id);
-    text += `🏢 ${company?.name || 'Компания'}\n`;
-    text += `💰 Баланс: ${user.balance} ₽\n\n`;
-    text += disclaimer;
-  } else {
-    // Проверяем, есть ли уже заявка
-    const existingRequest = await db.getAccessRequestByUserId(userId);
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...persistentKeyboard(isAdmin(userId), user)
+    });
+    return;
+  }
 
-    if (existingRequest) {
-      text += '⏳ Ваша заявка на рассмотрении.\n\n';
-      text += 'Ожидайте подтверждения администратора.';
-      await ctx.reply(text, { parse_mode: 'Markdown' });
+  if (user) {
+    // Пользователь зарегистрирован
+    let text = '🏠 *Визуализация натяжных потолков*\n\n';
+
+    if (user.user_type === 'company_owner') {
+      const company = await db.getCompanyByOwner(userId);
+      text += `🏢 *${company?.name || 'Компания'}* (владелец)\n`;
+      text += `💰 Ваш баланс: ${user.balance} ₽\n`;
+      text += `🏦 Общий счёт: ${company?.shared_balance || 0} ₽\n\n`;
+    } else if (user.user_type === 'employee') {
+      const company = await db.getCompany(user.company_id);
+      text += `🏢 ${company?.name || 'Компания'} (сотрудник)\n`;
+      text += `💰 Баланс: ${user.balance} ₽\n\n`;
     } else {
-      // Описание преимуществ для новых пользователей
-      const welcomeText = `🏠 *Визуализация натяжных потолков*
+      // individual
+      text += `👤 ${user.name || 'Частный пользователь'}\n`;
+      text += `💰 Баланс: ${user.balance} ₽\n\n`;
+    }
+
+    text += disclaimer;
+
+    // Проверяем приглашения в компании
+    const invites = await db.getPendingInvites(userId);
+    if (invites.length > 0) {
+      text += `\n\n📬 У вас ${invites.length} приглашение(й) в компании!`;
+    }
+
+    // Проверяем запрос на передачу прав
+    const transfer = await db.getPendingTransfer(userId);
+    if (transfer) {
+      text += `\n\n🔔 Вам предлагают стать владельцем компании "${transfer.company_name}"!`;
+    }
+
+    await ctx.reply(text, {
+      parse_mode: 'Markdown',
+      ...persistentKeyboard(false, user)
+    });
+    return;
+  }
+
+  // Новый пользователь - показываем выбор регистрации
+  const welcomeText = `🏠 *Визуализация натяжных потолков*
 
 🎯 *Что вы получите:*
 
 📸 *Мгновенная визуализация* — загрузите фото комнаты и получите реалистичный результат за 30-60 секунд
 
 🎨 *Гибкие настройки:*
-  • 8 цветов потолка (белый, бежевый, чёрный и др.)
-  • 4 текстуры (матовый, глянцевый, сатин, металлик)
-  • Теневые и парящие профили
-  • Одно- и двухуровневые конструкции
-
-💡 *Освещение на любой вкус:*
-  • Точечные светильники (1-16 шт)
-  • Люстры разных стилей
-  • Световые линии
-  • Трековые системы
-  • LED-подсветка
-
-⭐ *Дополнительные возможности:*
-  • Быстрые пресеты (Минимализм, Классика, Премиум)
-  • Сохранение любимых конфигураций
-  • История всех генераций
-  • Перегенерация с теми же настройками
+• Цвета, текстуры, профили
+• Точечные светильники, люстры
+• Световые линии, трековые системы
+• LED-подсветка, двухуровневые потолки
 
 💼 *Идеально для:*
-  • Показа клиенту прямо на замере
-  • Презентации вариантов в офисе
-  • Согласования дизайна до монтажа
+• Показа клиенту прямо на замере
+• Презентации вариантов в офисе
+• Согласования дизайна до монтажа
 
-_Стоимость: 75₽ за генерацию_`;
+_Стоимость: 75₽ за генерацию_
 
-      await ctx.reply(welcomeText, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([[Markup.button.callback('📝 Запросить доступ', 'request_access')]])
-      });
-    }
-    return;
-  }
+*Выберите тип регистрации:*`;
 
-  // Отправляем с постоянной клавиатурой
-  await ctx.reply(text, {
+  await ctx.reply(welcomeText, {
     parse_mode: 'Markdown',
-    ...persistentKeyboard(isAdmin(userId))
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('👤 Частный пользователь', 'register_individual')],
+      [Markup.button.callback('🏢 Компания', 'register_company')]
+    ])
   });
 });
 
@@ -471,7 +508,8 @@ bot.hears('👑 Админ-панель', async ctx => {
         [Markup.button.callback('🏢 Компании', 'admin_companies'), Markup.button.callback('👥 Все пользователи', 'admin_all_users')],
         [Markup.button.callback(`📋 Заявки (${stats.requests_count})`, 'admin_requests')],
         [Markup.button.callback('⚠️ Низкий баланс', 'admin_low_balance')],
-        [Markup.button.callback('📊 Статистика', 'admin_stats'), Markup.button.callback('💳 Транзакции', 'admin_transactions')]
+        [Markup.button.callback('📊 Статистика', 'admin_stats'), Markup.button.callback('💳 Транзакции', 'admin_transactions')],
+        [Markup.button.callback('💵 Расходы API', 'admin_api_costs')]
       ])
     }
   );
@@ -815,6 +853,7 @@ bot.action('admin', async ctx => {
         [Markup.button.callback(`📋 Заявки (${stats.requests_count})`, 'admin_requests')],
         [Markup.button.callback('⚠️ Низкий баланс', 'admin_low_balance')],
         [Markup.button.callback('📊 Статистика', 'admin_stats'), Markup.button.callback('💳 Транзакции', 'admin_transactions')],
+        [Markup.button.callback('💵 Расходы API', 'admin_api_costs')],
         [Markup.button.callback('⬅️ Назад', 'back_main')]
       ])
     }
@@ -1886,6 +1925,51 @@ bot.action('admin_stats', async ctx => {
   );
 });
 
+// ============ РАСХОДЫ API (REPLICATE) ============
+
+bot.action('admin_api_costs', async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  try {
+    const costStats = await db.getCostStats(30);
+    const dailyStats = await db.getDailyCostStats(7);
+
+    let text = '💵 *Расходы API Replicate*\n\n';
+    text += `📅 Период: ${costStats.period_days} дней\n`;
+    text += `💱 Курс USD: ${costStats.cbr_rate} ₽\n\n`;
+
+    text += '*📊 Сегодня:*\n';
+    text += `├ 🖼 Генераций: ${costStats.today.generations}\n`;
+    text += `├ 💰 Выручка: ${costStats.today.revenue_rub} ₽\n`;
+    text += `├ 💸 Себестоимость: $${costStats.today.cost_usd} (${costStats.today.cost_rub} ₽)\n`;
+    text += `└ 📈 Прибыль: ${costStats.today.profit_rub} ₽\n\n`;
+
+    text += '*📊 За период:*\n';
+    text += `├ 🖼 Генераций: ${costStats.total.generations}\n`;
+    text += `├ 💰 Выручка: ${costStats.total.revenue_rub} ₽\n`;
+    text += `├ 💸 Себестоимость: $${costStats.total.cost_usd} (${costStats.total.cost_rub} ₽)\n`;
+    text += `├ 📈 Прибыль: ${costStats.total.profit_rub} ₽\n`;
+    text += `└ 📊 Маржа: ${costStats.total.margin_percent}%\n\n`;
+
+    if (dailyStats.length > 0) {
+      text += '*📆 По дням (последние 7):*\n';
+      for (const day of dailyStats.slice(0, 7)) {
+        const dateStr = new Date(day.date).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+        text += `${dateStr}: ${day.generations} шт, +${day.revenue_rub}₽, -$${day.cost_usd}, =${day.profit_rub}₽\n`;
+      }
+    }
+
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(text, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Назад', 'admin')]])
+    });
+  } catch (e) {
+    console.error('admin_api_costs error:', e);
+    await ctx.answerCbQuery('Ошибка загрузки статистики');
+  }
+});
+
 // ============ ВИЗУАЛИЗАЦИЯ ============
 
 bot.action('new_visual', async ctx => {
@@ -2916,7 +3000,8 @@ bot.action('generate', async ctx => {
     // Шаг 3: Генерация
     await updateProgress(ctx, statusMsg.message_id, 3);
 
-    const output = await replicate.run("black-forest-labs/flux-kontext-max", {
+    const prediction = await replicate.predictions.create({
+      model: "black-forest-labs/flux-kontext-max",
       input: {
         prompt,
         input_image: base64Image,
@@ -2927,11 +3012,18 @@ bot.action('generate', async ctx => {
       }
     });
 
+    // Ожидаем завершения
+    const completedPrediction = await replicate.wait(prediction);
+    const output = completedPrediction.output;
+
     // Шаг 4: Обработка результата
     await updateProgress(ctx, statusMsg.message_id, 4);
 
     const resultUrl = Array.isArray(output) ? output[0] : output;
-    console.log(`[${userId}] Done: ${resultUrl}`);
+    const costUsd = completedPrediction.metrics?.predict_time
+      ? completedPrediction.metrics.predict_time * 0.003 // $0.003/sec для flux-kontext-max
+      : null;
+    console.log(`[${userId}] Done: ${resultUrl}, cost: $${costUsd || 'unknown'}`);
 
     // Списание (кроме админов)
     if (!isAdmin(userId) && user) {
@@ -2939,8 +3031,8 @@ bot.action('generate', async ctx => {
       await db.addTransaction(userId, -GENERATION_COST, 'generation', 'Генерация визуализации');
     }
 
-    // Сохраняем генерацию с URL результата
-    await db.addGeneration(userId, state.config, resultUrl);
+    // Сохраняем генерацию с URL результата и стоимостью API
+    await db.addGeneration(userId, state.config, resultUrl, costUsd);
     saveLastGeneration(userId, state.config, resultUrl);
 
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
@@ -3030,7 +3122,8 @@ bot.action('regenerate', async ctx => {
 
     await updateProgress(ctx, statusMsg.message_id, 3);
 
-    const output = await replicate.run("black-forest-labs/flux-kontext-max", {
+    const prediction = await replicate.predictions.create({
+      model: "black-forest-labs/flux-kontext-max",
       input: {
         prompt,
         input_image: base64Image,
@@ -3041,16 +3134,22 @@ bot.action('regenerate', async ctx => {
       }
     });
 
+    const completedPrediction = await replicate.wait(prediction);
+    const output = completedPrediction.output;
+
     await updateProgress(ctx, statusMsg.message_id, 4);
 
     const resultUrl = Array.isArray(output) ? output[0] : output;
+    const costUsd = completedPrediction.metrics?.predict_time
+      ? completedPrediction.metrics.predict_time * 0.003
+      : null;
 
     if (!isAdmin(userId) && user) {
       await db.updateUser(userId, { balance: user.balance - GENERATION_COST });
       await db.addTransaction(userId, -GENERATION_COST, 'generation', 'Перегенерация');
     }
 
-    await db.addGeneration(userId, state.config, resultUrl);
+    await db.addGeneration(userId, state.config, resultUrl, costUsd);
     saveLastGeneration(userId, state.config, resultUrl);
 
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
@@ -3078,290 +3177,746 @@ bot.action('regenerate', async ctx => {
   }
 });
 
-// ============ YOOKASSA ПЛАТЕЖИ ============
+// ============ РЕГИСТРАЦИЯ (v2.0) ============
 
-// Создание платежа в YooKassa
-async function createYooKassaPayment(userId, amount, generations, paymentType, distribution = null) {
-  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
-    console.log('YooKassa not configured, using test mode');
-    return null;
-  }
-
-  const idempotenceKey = uuidv4();
-  const paymentId = uuidv4();
-
-  const paymentData = {
-    amount: {
-      value: amount.toFixed(2),
-      currency: 'RUB'
-    },
-    capture: true,
-    confirmation: {
-      type: 'redirect',
-      return_url: `https://t.me/${process.env.BOT_USERNAME || 'potolki_ai_bot'}`
-    },
-    description: `Пополнение баланса: ${generations} генераций`,
-    metadata: {
-      userId: userId.toString(),
-      generations: generations,
-      paymentType: paymentType,
-      distribution: distribution ? JSON.stringify(distribution) : null
-    }
-  };
+// Регистрация как частный пользователь
+bot.action('register_individual', async ctx => {
+  const userId = ctx.from.id;
+  const name = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
+  const username = ctx.from.username;
 
   try {
-    const response = await axios.post(
-      'https://api.yookassa.ru/v3/payments',
-      paymentData,
+    const user = await db.registerIndividual(userId, name, username);
+    await ctx.answerCbQuery('✅ Регистрация успешна!');
+    await ctx.editMessageText(
+      '✅ *Регистрация завершена!*\n\n' +
+      `👤 ${user.name}\n` +
+      `💰 Баланс: 0 ₽\n\n` +
+      'Пополните баланс, чтобы начать использовать визуализации.\n' +
+      '_Стоимость: 75₽ за генерацию_',
       {
-        auth: {
-          username: YOOKASSA_SHOP_ID,
-          password: YOOKASSA_SECRET_KEY
-        },
-        headers: {
-          'Idempotence-Key': idempotenceKey,
-          'Content-Type': 'application/json'
-        }
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('💳 Пополнить баланс', 'topup_menu')],
+          [Markup.button.callback('🏠 Главное меню', 'back_main')]
+        ])
       }
     );
+  } catch (e) {
+    console.error('register_individual error:', e);
+    await ctx.answerCbQuery('Ошибка регистрации');
+  }
+});
 
-    // Сохраняем информацию о платеже
-    pendingPayments.set(response.data.id, {
-      oderId: paymentId,
-      userId: userId,
-      amount: amount,
-      generations: generations,
-      paymentType: paymentType,
-      distribution: distribution,
-      createdAt: new Date().toISOString()
-    });
+// Начало регистрации компании
+bot.action('register_company', async ctx => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  state.step = 'company_name';
 
-    return response.data;
-  } catch (error) {
-    console.error('YooKassa payment error:', error.response?.data || error.message);
-    return null;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '🏢 *Регистрация компании*\n\n' +
+    'Введите название вашей компании:',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// Обработка ввода названия компании
+bot.on('text', async (ctx, next) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+
+  if (state.step === 'company_name') {
+    const companyName = ctx.message.text.trim();
+    if (companyName.length < 2 || companyName.length > 100) {
+      return ctx.reply('❌ Название должно быть от 2 до 100 символов');
+    }
+
+    state.tempData.companyName = companyName;
+    state.step = 'company_inn';
+
+    await ctx.reply(
+      `🏢 Компания: *${companyName}*\n\n` +
+      'Введите ИНН (необязательно, можно пропустить):',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('⏭ Пропустить', 'skip_inn')]])
+      }
+    );
+    return;
+  }
+
+  if (state.step === 'company_inn') {
+    const inn = ctx.message.text.trim();
+    if (inn && (inn.length < 10 || inn.length > 12 || !/^\d+$/.test(inn))) {
+      return ctx.reply('❌ ИНН должен содержать 10-12 цифр');
+    }
+
+    state.tempData.inn = inn || null;
+    await finishCompanyRegistration(ctx, userId, state);
+    return;
+  }
+
+  // Если не регистрация - передаём дальше
+  return next();
+});
+
+bot.action('skip_inn', async ctx => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  state.tempData.inn = null;
+  await ctx.answerCbQuery();
+  await finishCompanyRegistration(ctx, userId, state);
+});
+
+async function finishCompanyRegistration(ctx, userId, state) {
+  const name = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
+  const username = ctx.from.username;
+
+  try {
+    const { user, company } = await db.registerCompanyOwner(
+      userId,
+      name,
+      username,
+      state.tempData.companyName,
+      state.tempData.inn
+    );
+
+    state.step = null;
+    state.tempData = {};
+
+    await ctx.reply(
+      '✅ *Компания зарегистрирована!*\n\n' +
+      `🏢 ${company.name}\n` +
+      (company.inn ? `📄 ИНН: ${company.inn}\n` : '') +
+      `👤 Владелец: ${user.name}\n\n` +
+      '*Что вы можете делать:*\n' +
+      '• Пополнять общий счёт компании\n' +
+      '• Приглашать сотрудников\n' +
+      '• Распределять баланс между сотрудниками\n' +
+      '• Видеть статистику по каждому\n\n' +
+      '_Стоимость генерации: 75₽_',
+      {
+        parse_mode: 'Markdown',
+        ...persistentKeyboard(false, user)
+      }
+    );
+  } catch (e) {
+    console.error('finishCompanyRegistration error:', e);
+    await ctx.reply('❌ Ошибка регистрации компании');
   }
 }
 
-// Webhook для получения уведомлений от YooKassa
-app.post('/yookassa-webhook', async (req, res) => {
-  try {
-    const notification = req.body;
+// ============ ПОПОЛНЕНИЕ БАЛАНСА (v2.0) ============
 
-    if (notification.event === 'payment.succeeded') {
-      const payment = notification.object;
-      const metadata = payment.metadata;
-
-      if (metadata && metadata.userId) {
-        const userId = parseInt(metadata.userId);
-        const generations = parseInt(metadata.generations);
-        const amount = parseFloat(payment.amount.value);
-        const paymentType = metadata.paymentType;
-
-        if (paymentType === 'company' && metadata.distribution) {
-          // Распределение по сотрудникам
-          const distribution = JSON.parse(metadata.distribution);
-
-          for (const [empId, gens] of Object.entries(distribution)) {
-            const empUser = await db.getUser(empId);
-            if (empUser) {
-              const addAmount = gens * GENERATION_COST;
-              await db.updateUser(empId, { balance: (empUser.balance || 0) + addAmount });
-              await db.addTransaction(empId, addAmount, 'topup', 'Пополнение от компании');
-
-              try {
-                await bot.telegram.sendMessage(empId,
-                  `💰 Ваш баланс пополнен на ${addAmount} ₽ (${gens} генераций)\n\nТекущий баланс: ${empUser.balance + addAmount} ₽`
-                );
-              } catch (e) {}
-            }
-          }
-
-          // Уведомляем плательщика
-          try {
-            await bot.telegram.sendMessage(userId,
-              `✅ Оплата ${amount} ₽ прошла успешно!\n\n` +
-              `Средства распределены между сотрудниками.`
-            );
-          } catch (e) {}
-        } else {
-          // Личное пополнение
-          const user = await db.getUser(userId);
-          if (user) {
-            const genAmount = generations * GENERATION_COST;
-            await db.updateUser(userId, { balance: (user.balance || 0) + genAmount });
-            await db.addTransaction(userId, genAmount, 'topup', 'Пополнение через YooKassa');
-
-            try {
-              await bot.telegram.sendMessage(userId,
-                `✅ Оплата ${amount} ₽ прошла успешно!\n\n` +
-                `💰 Баланс пополнен на ${genAmount} ₽\n` +
-                `🖼 Доступно генераций: ${Math.floor((user.balance + genAmount) / GENERATION_COST)}`
-              );
-            } catch (e) {}
-          }
-        }
-
-        // Удаляем из ожидающих
-        pendingPayments.delete(payment.id);
-      }
-    }
-
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).send('Error');
-  }
-});
-
-// Проверка статуса платежа
-app.get('/payment-status/:paymentId', async (req, res) => {
-  const { paymentId } = req.params;
-  const pending = pendingPayments.get(paymentId);
-
-  if (pending) {
-    res.json({ status: 'pending', ...pending });
-  } else {
-    res.json({ status: 'unknown' });
-  }
-});
-
-// ============ КНОПКА ОПЛАТЫ ============
-
-bot.action('pay_balance', async ctx => {
+bot.hears('💳 Пополнить', async ctx => {
   const userId = ctx.from.id;
   const user = await db.getUser(userId);
 
-  if (!user && !isAdmin(userId)) {
-    return ctx.answerCbQuery('Нет доступа');
+  if (!user) {
+    return ctx.reply('❌ Сначала зарегистрируйтесь: /start');
+  }
+
+  await showTopupMenu(ctx, user);
+});
+
+bot.action('topup_menu', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (!user) {
+    return ctx.answerCbQuery('Сначала зарегистрируйтесь');
   }
 
   await ctx.answerCbQuery();
+  await showTopupMenu(ctx, user);
+});
 
-  // Показываем информацию об оплате
+async function showTopupMenu(ctx, user) {
+  const isOwner = user.user_type === 'company_owner';
+
   let text = '💳 *Пополнение баланса*\n\n';
-  text += `📊 Стоимость 1 генерации: ${GENERATION_COST} ₽\n\n`;
+  text += `💰 Текущий баланс: ${user.balance} ₽\n`;
 
-  if (user) {
-    text += `💰 Ваш баланс: ${user.balance || 0} ₽\n`;
-    text += `🖼 Доступно генераций: ${Math.floor((user.balance || 0) / GENERATION_COST)}\n\n`;
+  if (isOwner) {
+    const company = await db.getCompanyByOwner(user.id);
+    text += `🏦 Общий счёт компании: ${company?.shared_balance || 0} ₽\n`;
   }
 
-  text += '📋 *Тарифы:*\n';
-  text += '• 1 генерация — 75 ₽\n';
-  text += '• 5 генераций — 375 ₽\n';
-  text += '• 10 генераций — 750 ₽\n';
-  text += '• 20 генераций — 1 500 ₽\n';
-  text += '• 40 генераций — 3 000 ₽\n\n';
+  text += '\n*Выберите сумму:*\n';
+  text += '_1 генерация = 75₽_';
 
-  const buttons = [];
+  const buttons = TOPUP_AMOUNTS.map(item =>
+    [Markup.button.callback(item.label, `topup_amount:${item.amount}`)]
+  );
 
-  if (YOOKASSA_SHOP_ID && YOOKASSA_SECRET_KEY && PAYMENT_WEBHOOK_URL) {
-    // YooKassa настроена - показываем WebApp
-    const webAppUrl = PAYMENT_WEBHOOK_URL.replace('/yookassa-webhook', '/payment.html');
-
-    // Проверяем, есть ли у пользователя сотрудники (для компании)
-    let startParam = '';
-    if (user) {
-      const companyUsers = await db.getCompanyUsers(user.company_id).filter(u => u.id != userId);
-      if (companyUsers.length > 0) {
-        const employeesData = companyUsers.map(u => ({ id: u.id.toString(), name: u.name || 'Сотрудник' }));
-        startParam = Buffer.from(JSON.stringify({ employees: employeesData })).toString('base64');
-      }
-    }
-
-    text += '✅ Оплата через YooKassa';
-    buttons.push([Markup.button.webApp('💳 Перейти к оплате', webAppUrl + (startParam ? `?data=${startParam}` : ''))]);
-  } else {
-    // YooKassa не настроена - показываем быстрые кнопки для тестирования
-    text += '⚠️ _Система оплаты в процессе настройки_\n';
-    text += 'Выберите сумму для создания счёта:';
-
-    buttons.push([
-      Markup.button.callback('375 ₽ (5 ген.)', 'create_invoice_375'),
-      Markup.button.callback('750 ₽ (10 ген.)', 'create_invoice_750')
-    ]);
-    buttons.push([
-      Markup.button.callback('1500 ₽ (20 ген.)', 'create_invoice_1500'),
-      Markup.button.callback('3000 ₽ (40 ген.)', 'create_invoice_3000')
-    ]);
+  if (isOwner) {
+    buttons.push([Markup.button.callback('🏢 На счёт компании', 'topup_company')]);
   }
 
-  buttons.push([Markup.button.callback('⬅️ Назад', 'back_main')]);
+  buttons.push([Markup.button.callback('🏠 Назад', 'back_main')]);
 
-  try {
+  if (ctx.callbackQuery) {
     await ctx.editMessageText(text, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard(buttons)
     });
-  } catch (e) {
+  } else {
     await ctx.reply(text, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard(buttons)
     });
   }
-});
+}
 
-// Обработка создания счёта (тестовый режим)
-bot.action(/^create_invoice_(\d+)$/, async ctx => {
+// Выбор суммы для личного пополнения
+bot.action(/^topup_amount:(\d+)$/, async ctx => {
   const userId = ctx.from.id;
   const amount = parseInt(ctx.match[1]);
-  const generations = Math.floor(amount / GENERATION_COST);
+
+  const payment = await db.createPayment(userId, amount, null, null, `Пополнение баланса ${amount}₽`);
+
+  const result = await createYooKassaPayment(
+    amount,
+    `Визуализация потолков: ${amount}₽`,
+    BOT_URL,
+    { payment_id: payment.id, user_id: userId }
+  );
+
+  if (result.success) {
+    await db.updatePaymentYookassa(payment.id, result.paymentId, result.status);
+
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(
+      `💳 *Оплата ${amount} ₽*\n\n` +
+      'Нажмите кнопку ниже для оплаты.\n' +
+      'После оплаты баланс пополнится автоматически.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('💳 Оплатить', result.confirmationUrl)],
+          [Markup.button.callback('✅ Я оплатил', `check_payment:${payment.id}`)],
+          [Markup.button.callback('❌ Отмена', 'back_main')]
+        ])
+      }
+    );
+  } else {
+    await ctx.answerCbQuery('Ошибка создания платежа');
+    console.error('YooKassa error:', result.error);
+  }
+});
+
+// Проверка статуса оплаты
+bot.action(/^check_payment:(\d+)$/, async ctx => {
+  const paymentId = parseInt(ctx.match[1]);
+
+  const payment = await db.pool.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+  if (!payment.rows[0]) {
+    return ctx.answerCbQuery('Платёж не найден');
+  }
+
+  const yookassaId = payment.rows[0].yookassa_payment_id;
+  const status = await getYooKassaPaymentStatus(yookassaId);
+
+  if (status.success && status.status === 'succeeded') {
+    await db.updatePaymentYookassa(paymentId, yookassaId, 'succeeded', status.paymentMethod);
+    await db.processSuccessfulPayment(paymentId);
+
+    const user = await db.getUser(ctx.from.id);
+    await ctx.answerCbQuery('✅ Оплата подтверждена!');
+    await ctx.editMessageText(
+      '✅ *Оплата успешна!*\n\n' +
+      `💰 Новый баланс: ${user.balance} ₽`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+      }
+    );
+  } else if (status.status === 'canceled') {
+    await ctx.answerCbQuery('❌ Платёж отменён');
+  } else {
+    await ctx.answerCbQuery('⏳ Ожидание оплаты...');
+  }
+});
+
+// Пополнение счёта компании
+bot.action('topup_company', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (user?.user_type !== 'company_owner') {
+    return ctx.answerCbQuery('Только для владельцев компаний');
+  }
+
+  const company = await db.getCompanyByOwner(userId);
 
   await ctx.answerCbQuery();
-
   await ctx.editMessageText(
-    `📝 *Счёт на оплату*\n\n` +
-    `💰 Сумма: ${amount} ₽\n` +
-    `🖼 Генераций: ${generations}\n\n` +
-    `⚠️ _Для подключения онлайн-оплаты необходимо настроить YooKassa_\n\n` +
-    `Для ручного пополнения обратитесь к администратору.`,
+    `🏢 *Пополнение счёта компании*\n\n` +
+    `Компания: ${company.name}\n` +
+    `Текущий общий счёт: ${company.shared_balance} ₽\n\n` +
+    '*Выберите сумму:*',
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('⬅️ Назад', 'pay_balance')]
+        ...TOPUP_AMOUNTS.map(item =>
+          [Markup.button.callback(item.label, `topup_company_amount:${item.amount}`)]
+        ),
+        [Markup.button.callback('⬅️ Назад', 'topup_menu')]
       ])
     }
   );
 });
 
-// Обработка данных из WebApp
-bot.on('web_app_data', async ctx => {
+bot.action(/^topup_company_amount:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const amount = parseInt(ctx.match[1]);
+  const company = await db.getCompanyByOwner(userId);
+
+  const payment = await db.createPayment(userId, amount, company.id, null, `Пополнение счёта компании ${amount}₽`);
+
+  const result = await createYooKassaPayment(
+    amount,
+    `${company.name}: пополнение ${amount}₽`,
+    BOT_URL,
+    { payment_id: payment.id, user_id: userId, company_id: company.id }
+  );
+
+  if (result.success) {
+    await db.updatePaymentYookassa(payment.id, result.paymentId, result.status);
+
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(
+      `🏢 *Оплата для компании ${amount} ₽*\n\n` +
+      'Нажмите кнопку для оплаты.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('💳 Оплатить', result.confirmationUrl)],
+          [Markup.button.callback('✅ Я оплатил', `check_payment:${payment.id}`)],
+          [Markup.button.callback('❌ Отмена', 'back_main')]
+        ])
+      }
+    );
+  } else {
+    await ctx.answerCbQuery('Ошибка создания платежа');
+  }
+});
+
+// ============ УПРАВЛЕНИЕ КОМПАНИЕЙ (v2.0) ============
+
+bot.hears('🏢 Моя компания', async ctx => {
+  const userId = ctx.from.id;
+  const user = await db.getUser(userId);
+
+  if (user?.user_type !== 'company_owner') {
+    return ctx.reply('❌ Вы не являетесь владельцем компании');
+  }
+
+  const company = await db.getCompanyByOwner(userId);
+  const stats = await db.getCompanyStats(company.id);
+  const employees = await db.getCompanyEmployeeStats(company.id);
+
+  let text = `🏢 *${company.name}*\n\n`;
+  text += `🏦 Общий счёт: ${stats.shared_balance} ₽\n`;
+  text += `👥 Сотрудников: ${stats.employees_count}\n`;
+  text += `💰 Балансы сотрудников: ${stats.total_employee_balance} ₽\n`;
+  text += `🖼 Генераций всего: ${stats.total_generations}\n`;
+  text += `📅 Сегодня: ${stats.today_generations}\n\n`;
+
+  if (employees.length > 0) {
+    text += '*Сотрудники:*\n';
+    for (const emp of employees) {
+      const role = emp.user_type === 'company_owner' ? '👑' : '👤';
+      text += `${role} ${emp.name || emp.username || emp.id}: ${emp.balance}₽, ${emp.total_generations} ген.\n`;
+    }
+  }
+
+  await ctx.reply(text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Пригласить сотрудника', 'invite_employee')],
+      [Markup.button.callback('💸 Распределить баланс', 'distribute_balance')],
+      [Markup.button.callback('👑 Передать права', 'transfer_ownership')],
+      [Markup.button.callback('🏠 Главное меню', 'back_main')]
+    ])
+  });
+});
+
+// Приглашение сотрудника
+bot.action('invite_employee', async ctx => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+  state.step = 'invite_employee';
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '➕ *Приглашение сотрудника*\n\n' +
+    'Перешлите мне любое сообщение от пользователя, которого хотите пригласить,\n' +
+    'или введите его Telegram ID (число).',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('❌ Отмена', 'back_main')]])
+    }
+  );
+});
+
+// Обработка приглашения (forward или ID)
+bot.on('forward', async (ctx, next) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+
+  if (state.step === 'invite_employee') {
+    const forwardFrom = ctx.message.forward_from;
+    if (!forwardFrom) {
+      return ctx.reply('❌ Не удалось получить ID пользователя. Попросите его разрешить пересылку или введите ID вручную.');
+    }
+
+    await processInvite(ctx, userId, forwardFrom.id);
+    return;
+  }
+
+  return next();
+});
+
+// Ввод ID для приглашения
+bot.hears(/^\d{5,15}$/, async (ctx, next) => {
+  const userId = ctx.from.id;
+  const state = getState(userId);
+
+  if (state.step === 'invite_employee') {
+    const invitedId = parseInt(ctx.message.text);
+    await processInvite(ctx, userId, invitedId);
+    return;
+  }
+
+  return next();
+});
+
+async function processInvite(ctx, ownerId, invitedId) {
+  const state = getState(ownerId);
+  state.step = null;
+
+  if (ownerId === invitedId) {
+    return ctx.reply('❌ Нельзя пригласить самого себя');
+  }
+
+  const company = await db.getCompanyByOwner(ownerId);
+
+  // Проверяем, не состоит ли уже в компании
+  const existingUser = await db.getUser(invitedId);
+  if (existingUser?.company_id) {
+    return ctx.reply('❌ Пользователь уже состоит в компании');
+  }
+
+  const invite = await db.inviteToCompany(company.id, invitedId, ownerId);
+  if (!invite) {
+    return ctx.reply('❌ Приглашение уже отправлено этому пользователю');
+  }
+
+  await ctx.reply(
+    `✅ Приглашение отправлено!\n\n` +
+    `Когда пользователь напишет боту /start, он увидит приглашение в компанию "${company.name}".`
+  );
+
+  // Пытаемся отправить уведомление приглашённому
   try {
-    const data = JSON.parse(ctx.message.web_app_data.data);
-    const userId = ctx.from.id;
+    await ctx.telegram.sendMessage(invitedId,
+      `📬 *Приглашение в компанию!*\n\n` +
+      `Вас приглашают присоединиться к компании "${company.name}".\n\n` +
+      `Нажмите /start чтобы принять или отклонить приглашение.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (e) {
+    // Пользователь мог не начинать диалог с ботом
+  }
+}
 
-    if (data.action === 'payment') {
-      const { amount, generations, type, distribution } = data;
+// Распределение баланса
+bot.action('distribute_balance', async ctx => {
+  const userId = ctx.from.id;
+  const company = await db.getCompanyByOwner(userId);
+  const employees = await db.getCompanyUsers(company.id);
 
-      // Создаём платёж в YooKassa
-      const payment = await createYooKassaPayment(userId, amount, generations, type, distribution);
+  if (employees.length === 0) {
+    return ctx.answerCbQuery('В компании нет сотрудников');
+  }
 
-      if (payment && payment.confirmation?.confirmation_url) {
-        await ctx.reply(
-          `💳 *Оплата ${amount} ₽*\n\n` +
-          `🖼 Генераций: ${generations}\n\n` +
-          'Нажмите кнопку для перехода к оплате:',
-          {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-              [Markup.button.url('💳 Перейти к оплате', payment.confirmation.confirmation_url)],
-              [Markup.button.callback('❌ Отмена', 'back_main')]
-            ])
-          }
-        );
-      } else {
-        // Тестовый режим или ошибка
-        await ctx.reply(
-          '⚠️ Система оплаты временно недоступна.\n\n' +
-          'Обратитесь к администратору для пополнения баланса.',
-          persistentKeyboard(isAdmin(userId))
-        );
+  if (company.shared_balance < 75) {
+    return ctx.answerCbQuery('Недостаточно средств на общем счёте');
+  }
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `💸 *Распределение баланса*\n\n` +
+    `🏦 Общий счёт: ${company.shared_balance} ₽\n` +
+    `👥 Сотрудников: ${employees.length}\n\n` +
+    `*Выберите способ:*`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('⚖️ Поровну всем', 'distribute_evenly')],
+        [Markup.button.callback('📝 Указать суммы', 'distribute_custom')],
+        [Markup.button.callback('⬅️ Назад', 'back_main')]
+      ])
+    }
+  );
+});
+
+bot.action('distribute_evenly', async ctx => {
+  const userId = ctx.from.id;
+  const company = await db.getCompanyByOwner(userId);
+  const employees = await db.getCompanyUsers(company.id);
+
+  // Расчёт суммы на каждого (кратно 75)
+  const perPerson = Math.floor(company.shared_balance / employees.length / 75) * 75;
+
+  if (perPerson < 75) {
+    return ctx.answerCbQuery('Недостаточно для равного распределения');
+  }
+
+  const totalToDistribute = perPerson * employees.length;
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `⚖️ *Равное распределение*\n\n` +
+    `Каждому из ${employees.length} сотрудников: ${perPerson} ₽\n` +
+    `Итого: ${totalToDistribute} ₽\n` +
+    `Останется: ${company.shared_balance - totalToDistribute} ₽\n\n` +
+    `Подтвердить?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Распределить', `confirm_distribute:${perPerson}`)],
+        [Markup.button.callback('❌ Отмена', 'back_main')]
+      ])
+    }
+  );
+});
+
+bot.action(/^confirm_distribute:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const perPerson = parseInt(ctx.match[1]);
+  const company = await db.getCompanyByOwner(userId);
+
+  try {
+    await db.distributeEvenly(company.id, userId, company.shared_balance);
+    await ctx.answerCbQuery('✅ Баланс распределён!');
+
+    const updatedCompany = await db.getCompanyByOwner(userId);
+    await ctx.editMessageText(
+      `✅ *Баланс распределён!*\n\n` +
+      `🏦 Остаток на общем счёте: ${updatedCompany.shared_balance} ₽`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+      }
+    );
+  } catch (e) {
+    console.error('distribute error:', e);
+    await ctx.answerCbQuery('Ошибка: ' + e.message);
+  }
+});
+
+// Передача прав владельца
+bot.action('transfer_ownership', async ctx => {
+  const userId = ctx.from.id;
+  const company = await db.getCompanyByOwner(userId);
+  const employees = await db.getCompanyUsers(company.id);
+  const otherEmployees = employees.filter(e => e.id !== userId);
+
+  if (otherEmployees.length === 0) {
+    return ctx.answerCbQuery('Нет сотрудников для передачи');
+  }
+
+  const buttons = otherEmployees.map(e =>
+    [Markup.button.callback(`👤 ${e.name || e.username || e.id}`, `transfer_to:${e.id}`)]
+  );
+  buttons.push([Markup.button.callback('❌ Отмена', 'back_main')]);
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    `👑 *Передача прав владельца*\n\n` +
+    `⚠️ Вы потеряете права владельца компании!\n\n` +
+    `Выберите нового владельца:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons)
+    }
+  );
+});
+
+bot.action(/^transfer_to:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const toUserId = parseInt(ctx.match[1]);
+  const company = await db.getCompanyByOwner(userId);
+
+  try {
+    await db.requestOwnershipTransfer(company.id, userId, toUserId);
+
+    await ctx.answerCbQuery('Запрос отправлен');
+    await ctx.editMessageText(
+      `✅ *Запрос на передачу отправлен*\n\n` +
+      `Пользователь должен принять запрос.\n` +
+      `После принятия он станет новым владельцем, а вы - сотрудником.`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+      }
+    );
+
+    // Уведомляем нового владельца
+    try {
+      await ctx.telegram.sendMessage(toUserId,
+        `🔔 *Запрос на передачу прав!*\n\n` +
+        `Вам предлагают стать владельцем компании "${company.name}".\n\n` +
+        `Нажмите /start чтобы принять или отклонить.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {}
+  } catch (e) {
+    await ctx.answerCbQuery('Ошибка: ' + e.message);
+  }
+});
+
+// ============ ПРИНЯТИЕ ПРИГЛАШЕНИЙ (v2.0) ============
+
+bot.action(/^accept_invite:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const inviteId = parseInt(ctx.match[1]);
+
+  try {
+    await db.acceptInvite(inviteId, userId);
+    const user = await db.getUser(userId);
+    const company = await db.getCompany(user.company_id);
+
+    await ctx.answerCbQuery('✅ Приглашение принято!');
+    await ctx.editMessageText(
+      `✅ *Вы присоединились к компании!*\n\n` +
+      `🏢 ${company.name}\n` +
+      `💰 Ваш баланс: ${user.balance} ₽`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+      }
+    );
+  } catch (e) {
+    await ctx.answerCbQuery('Ошибка: ' + e.message);
+  }
+});
+
+bot.action(/^decline_invite:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const inviteId = parseInt(ctx.match[1]);
+
+  await db.declineInvite(inviteId, userId);
+  await ctx.answerCbQuery('Приглашение отклонено');
+  await ctx.editMessageText('❌ Приглашение отклонено', {
+    ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+  });
+});
+
+// Принятие передачи прав
+bot.action(/^accept_transfer:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const transferId = parseInt(ctx.match[1]);
+
+  try {
+    await db.acceptOwnershipTransfer(transferId, userId);
+    const user = await db.getUser(userId);
+    const company = await db.getCompanyByOwner(userId);
+
+    await ctx.answerCbQuery('✅ Вы стали владельцем!');
+    await ctx.editMessageText(
+      `👑 *Вы стали владельцем компании!*\n\n` +
+      `🏢 ${company.name}\n` +
+      `🏦 Общий счёт: ${company.shared_balance} ₽`,
+      {
+        parse_mode: 'Markdown',
+        ...persistentKeyboard(false, user)
+      }
+    );
+  } catch (e) {
+    await ctx.answerCbQuery('Ошибка: ' + e.message);
+  }
+});
+
+bot.action(/^decline_transfer:(\d+)$/, async ctx => {
+  const userId = ctx.from.id;
+  const transferId = parseInt(ctx.match[1]);
+
+  await db.declineOwnershipTransfer(transferId, userId);
+  await ctx.answerCbQuery('Запрос отклонён');
+  await ctx.editMessageText('❌ Запрос на передачу прав отклонён', {
+    ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+  });
+});
+
+// ============ СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ (v2.0) ============
+
+bot.hears('📊 Статистика', async ctx => {
+  const userId = ctx.from.id;
+  const stats = await db.getUserStats(userId);
+
+  if (!stats) {
+    return ctx.reply('❌ Сначала зарегистрируйтесь: /start');
+  }
+
+  let text = `📊 *Ваша статистика*\n\n`;
+  text += `👤 ${stats.name || 'Пользователь'}\n`;
+  text += `💰 Баланс: ${stats.balance} ₽\n\n`;
+
+  text += `*Генерации:*\n`;
+  text += `├ Всего: ${stats.total_generations}\n`;
+  text += `├ Сегодня: ${stats.today_generations}\n`;
+  text += `└ Потрачено: ${stats.total_spent} ₽\n\n`;
+
+  text += `*Пополнения:*\n`;
+  text += `└ Всего: ${stats.total_topups} ₽\n`;
+
+  if (stats.company_name) {
+    text += `\n🏢 Компания: ${stats.company_name}\n`;
+    if (stats.user_type === 'company_owner') {
+      text += `🏦 Общий счёт: ${stats.company_balance} ₽`;
+    }
+  }
+
+  await ctx.reply(text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Главное меню', 'back_main')]])
+  });
+});
+
+// ============ WEBHOOK ДЛЯ YOOKASSA ============
+
+app.post('/yookassa-webhook', async (req, res) => {
+  try {
+    const data = parseYooKassaWebhook(req.body);
+    if (!data) {
+      return res.status(400).send('Invalid webhook');
+    }
+
+    console.log('YooKassa webhook:', data.event, data.paymentId);
+
+    if (data.event === 'payment.succeeded') {
+      const payment = await db.getPaymentByYookassaId(data.paymentId);
+      if (payment && payment.yookassa_status !== 'succeeded') {
+        await db.updatePaymentYookassa(payment.id, data.paymentId, 'succeeded');
+        await db.processSuccessfulPayment(payment.id);
+        console.log('Payment processed:', payment.id);
+      }
+    } else if (data.event === 'payment.canceled') {
+      const payment = await db.getPaymentByYookassaId(data.paymentId);
+      if (payment) {
+        await db.updatePaymentYookassa(payment.id, data.paymentId, 'canceled');
       }
     }
-  } catch (error) {
-    console.error('WebApp data error:', error);
-    await ctx.reply('❌ Ошибка обработки платежа');
+
+    res.status(200).send('OK');
+  } catch (e) {
+    console.error('Webhook error:', e);
+    res.status(500).send('Error');
   }
 });
 
