@@ -2,3 +2,11 @@ node_modules/
 .env
 *.log
 data.json
+
+# Backups
+*.backup
+*.backup-*
+*.before-*
+.bot.lock
+CLAUDE.md
+.env.backup

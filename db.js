@@ -414,10 +414,14 @@ async function registerCompanyOwner(userId, name, username, companyName, inn = n
     await client.query('BEGIN');
 
     // Создаём компанию
+    // Генерируем уникальный invite_code (без похожих символов 0/O, 1/I)
+    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const inviteCode = Array.from({length: 6}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+    
     const companyResult = await client.query(
-      `INSERT INTO companies (name, owner_id, inn, description, shared_balance)
-       VALUES ($1, $2, $3, $4, 0) RETURNING *`,
-      [companyName, userId, inn, description]
+      `INSERT INTO companies (name, owner_id, inn, description, shared_balance, invite_code)
+       VALUES ($1, $2, $3, $4, 0, $5) RETURNING *`,
+      [companyName, userId, inn, description, inviteCode]
     );
     const company = companyResult.rows[0];
 
@@ -660,9 +664,9 @@ async function updatePaymentYookassa(paymentId, yookassaPaymentId, status, payme
   const result = await pool.query(
     `UPDATE payments SET
        yookassa_payment_id = $2,
-       yookassa_status = $3,
+       yookassa_status = $3::varchar,
        payment_method = $4,
-       paid_at = CASE WHEN $3 = 'succeeded' THEN NOW() ELSE paid_at END
+       paid_at = CASE WHEN $3::varchar = 'succeeded' THEN NOW() ELSE paid_at END
      WHERE id = $1 RETURNING *`,
     [paymentId, yookassaPaymentId, status, paymentMethod]
   );
@@ -890,6 +894,62 @@ async function getCompanyByOwner(ownerId) {
   return result.rows[0];
 }
 
+// ============ PENDING GENERATIONS (для webhooks) ============
+
+async function createPendingGeneration(predictionId, userId, chatId, statusMessageId, config, photo) {
+  const result = await pool.query(
+    `INSERT INTO pending_generations (prediction_id, user_id, chat_id, status_message_id, config, photo)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [predictionId, userId, chatId, statusMessageId, JSON.stringify(config), photo]
+  );
+  return result.rows[0];
+}
+
+async function getPendingGeneration(predictionId) {
+  const result = await pool.query(
+    `SELECT * FROM pending_generations WHERE prediction_id = $1`,
+    [predictionId]
+  );
+  return result.rows[0];
+}
+
+async function updatePendingGeneration(predictionId, status) {
+  await pool.query(
+    `UPDATE pending_generations SET status = $1 WHERE prediction_id = $2`,
+    [status, predictionId]
+  );
+}
+
+async function deletePendingGeneration(predictionId) {
+  await pool.query(
+    `DELETE FROM pending_generations WHERE prediction_id = $1`,
+    [predictionId]
+  );
+}
+
+
+// Получить компанию по invite_code
+async function getCompanyByInviteCode(inviteCode) {
+  const result = await pool.query(
+    'SELECT * FROM companies WHERE UPPER(invite_code) = UPPER($1)',
+    [inviteCode]
+  );
+  return result.rows[0];
+}
+
+// Регистрация сотрудника
+async function registerEmployee(userId, name, username, companyId) {
+  const result = await pool.query(
+    `INSERT INTO users (id, name, username, company_id, user_type, balance)
+     VALUES ($1, $2, $3, $4, 'employee', 0)
+     ON CONFLICT (id) DO UPDATE SET
+       name = $2, username = $3, company_id = $4, user_type = 'employee'
+     RETURNING *`,
+    [userId, name, username, companyId]
+  );
+  return result.rows[0];
+}
+
 module.exports = {
   pool,
   getCompanies,
@@ -947,5 +1007,12 @@ module.exports = {
   getCompanyStats,
   getCompanyEmployeeStats,
   getUserStats,
-  getCompanyByOwner
+  getCompanyByOwner,
+  getCompanyByInviteCode,
+  registerEmployee,
+  // Pending generations (webhooks)
+  createPendingGeneration,
+  getPendingGeneration,
+  updatePendingGeneration,
+  deletePendingGeneration
 };
