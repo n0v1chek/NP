@@ -133,6 +133,10 @@ async function generateWithRetry(prompt, base64Image, maxRetries = 3) {
     throw new Error(`Prediction failed: ${completedPrediction.error}`);
   }
 
+  // Логируем расход в общую таблицу
+  const costUsd = 0.15; // Цена google/nano-banana-pro
+  await db.logReplicateUsage("google/nano-banana-pro", costUsd, prompt, completedPrediction.id);
+
   return completedPrediction;
 }
 

@@ -144,7 +144,7 @@ async function getUserTransactions(userId) {
 
 async function addGeneration(userId, config, resultUrl = null, costUsd = null) {
   const result = await pool.query(
-    'INSERT INTO generations (user_id, config, result_url, cost_usd) VALUES ($1, $2, $3, $4) RETURNING *',
+    'INSERT INTO generations (user_id, config, output_image, cost_usd) VALUES ($1, $2, $3, $4) RETURNING *',
     [userId, JSON.stringify(config), resultUrl, costUsd]
   );
   return result.rows[0];
@@ -244,14 +244,13 @@ async function getStats() {
 async function getCostStats(days = 30) {
   // Внутренний курс компании для пополнения в доллары
   const CBR_RATE = 140.0;
+  const PRICE_PER_GENERATION = 150; // Цена для клиента в рублях
 
   const result = await pool.query(`
     SELECT
       COUNT(*) as total_generations,
-      COALESCE(SUM(cost), 0) as total_revenue_rub,
       COALESCE(SUM(cost_usd), 0) as total_cost_usd,
       COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) as today_generations,
-      COALESCE(SUM(cost) FILTER (WHERE created_at::date = CURRENT_DATE), 0) as today_revenue_rub,
       COALESCE(SUM(cost_usd) FILTER (WHERE created_at::date = CURRENT_DATE), 0) as today_cost_usd
     FROM generations
     WHERE created_at > NOW() - INTERVAL '1 day' * $1
@@ -259,13 +258,15 @@ async function getCostStats(days = 30) {
 
   const row = result.rows[0];
 
-  const totalRevenueRub = parseFloat(row.total_revenue_rub) || 0;
+  const totalGenerations = parseInt(row.total_generations) || 0;
+  const totalRevenueRub = totalGenerations * PRICE_PER_GENERATION;
   const totalCostUsd = parseFloat(row.total_cost_usd) || 0;
   const totalCostRub = totalCostUsd * CBR_RATE;
   const totalProfitRub = totalRevenueRub - totalCostRub;
   const marginPercent = totalCostRub > 0 ? ((totalRevenueRub - totalCostRub) / totalCostRub * 100) : 0;
 
-  const todayRevenueRub = parseFloat(row.today_revenue_rub) || 0;
+  const todayGenerations = parseInt(row.today_generations) || 0;
+  const todayRevenueRub = todayGenerations * PRICE_PER_GENERATION;
   const todayCostUsd = parseFloat(row.today_cost_usd) || 0;
   const todayCostRub = todayCostUsd * CBR_RATE;
   const todayProfitRub = todayRevenueRub - todayCostRub;
@@ -274,7 +275,7 @@ async function getCostStats(days = 30) {
     period_days: days,
     cbr_rate: CBR_RATE,
     total: {
-      generations: parseInt(row.total_generations) || 0,
+      generations: totalGenerations,
       revenue_rub: Math.round(totalRevenueRub * 100) / 100,
       cost_usd: Math.round(totalCostUsd * 10000) / 10000,
       cost_rub: Math.round(totalCostRub * 100) / 100,
@@ -282,7 +283,7 @@ async function getCostStats(days = 30) {
       margin_percent: Math.round(marginPercent * 10) / 10
     },
     today: {
-      generations: parseInt(row.today_generations) || 0,
+      generations: todayGenerations,
       revenue_rub: Math.round(todayRevenueRub * 100) / 100,
       cost_usd: Math.round(todayCostUsd * 10000) / 10000,
       cost_rub: Math.round(todayCostRub * 100) / 100,
@@ -294,12 +295,12 @@ async function getCostStats(days = 30) {
 async function getDailyCostStats(days = 30) {
   // Внутренний курс компании для пополнения в доллары
   const CBR_RATE = 140.0;
+  const PRICE_PER_GENERATION = 150; // Цена для клиента в рублях
 
   const result = await pool.query(`
     SELECT
       DATE(created_at) as date,
       COUNT(*) as generations,
-      COALESCE(SUM(cost), 0) as revenue_rub,
       COALESCE(SUM(cost_usd), 0) as cost_usd
     FROM generations
     WHERE created_at > NOW() - INTERVAL '1 day' * $1
@@ -308,7 +309,8 @@ async function getDailyCostStats(days = 30) {
   `, [days]);
 
   return result.rows.map(row => {
-    const revenueRub = parseFloat(row.revenue_rub) || 0;
+    const generations = parseInt(row.generations) || 0;
+    const revenueRub = generations * PRICE_PER_GENERATION;
     const costUsd = parseFloat(row.cost_usd) || 0;
     const costRub = costUsd * CBR_RATE;
     const profitRub = revenueRub - costRub;
@@ -316,7 +318,7 @@ async function getDailyCostStats(days = 30) {
 
     return {
       date: row.date,
-      generations: parseInt(row.generations) || 0,
+      generations: generations,
       revenue_rub: Math.round(revenueRub * 100) / 100,
       cost_usd: Math.round(costUsd * 10000) / 10000,
       cost_rub: Math.round(costRub * 100) / 100,
@@ -1014,5 +1016,20 @@ module.exports = {
   createPendingGeneration,
   getPendingGeneration,
   updatePendingGeneration,
-  deletePendingGeneration
+  deletePendingGeneration,
+  logReplicateUsage
 };
+
+// Логирование расходов Replicate в общую таблицу
+async function logReplicateUsage(model, costUsd, prompt, predictionId) {
+  try {
+    await pool.query(
+      `INSERT INTO replicate_usage (source, model, cost_usd, prompt, prediction_id)
+       VALUES ('potolki', $1, $2, $3, $4)`,
+      [model, costUsd, prompt ? prompt.substring(0, 500) : null, predictionId]
+    );
+  } catch (e) {
+    console.error('Failed to log replicate usage:', e.message);
+  }
+}
+
